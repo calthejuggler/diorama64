@@ -1,0 +1,4 @@
+[submodule "games/sm64/upstream"]
+	path = games/sm64/upstream
+	url = https://github.com/coop-deluxe/sm64coopdx.git
+	shallow = true

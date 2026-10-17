@@ -1,0 +1,552 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Story mode and game flow
+
+Seams the host uses to run the game's flow, all inert without gArMode:
+
+- gArStory runs the title screen, file select, act selector and the vanilla
+  game flow (entry script, Start, attract demo); gArScreen says which screen
+  is up and returns to LEVEL when a level is cleared. The act selector
+  exposes a pick seam so the host can choose an act.
+- initiate_warp and the game-over path offer each warp to the host first
+  (before_warp, game_over); a warp the host handles makes the game skip its
+  own follow-ups.
+- the level script's MARIO_POS is recorded on every level load, before any
+  warp moves Mario, so the host can put that floor on the table top.
+- there is no save prompt: a star or key is saved at once ("Save &
+  Continue") and each such save is reported to the host.
+---
+ levels/entry.c                    | 13 +++++++++++++
+ levels/intro/script.c             | 13 +++++++++++--
+ src/engine/level_script.c         | 17 +++++++++++++++++
+ src/game/ar_game_hooks.h          | 12 ++++++++++++
+ src/game/interaction.c            |  3 +++
+ src/game/level_update.c           | 15 +++++++++++++++
+ src/game/mario_actions_cutscene.c | 19 +++++++++++++------
+ src/game/rendering_graph_node.c   |  3 ++-
+ src/game/save_file.c              |  8 ++++++++
+ src/menu/file_select.c            |  2 ++
+ src/menu/level_select_menu.c      |  5 +++++
+ src/menu/level_select_menu.h      |  1 +
+ src/menu/star_select.c            | 17 +++++++++++++++++
+ src/menu/star_select.h            |  5 +++++
+ src/pc/gfx/gfx_ar_hooks.h         |  8 ++++++++
+ src/pc/gfx/gfx_pc.c               |  3 +++
+ 16 files changed, 135 insertions(+), 9 deletions(-)
+
+diff --git a/levels/entry.c b/levels/entry.c
+index 3a508cb..a7c23fe 100644
+--- a/levels/entry.c
++++ b/levels/entry.c
+@@ -5,14 +5,18 @@
+ 
+ #include "levels/menu/header.h"
+ #include "levels/scripts.h"
++#include "menu/level_select_menu.h"
+ 
+ // #include "levels/intro/header.h"
+ 
+ #include "make_const_nonconst.h"
+ 
+ extern const LevelScript level_intro_splash_screen[];
++extern const LevelScript level_script_entry_ar_story[];
+ const LevelScript level_script_entry[] = {
+ #if 1
++    CALL(/*arg*/ 0, /*func*/ lvl_ar_story),   /* AR: Start in Story runs the title, as the #else below */
++    JUMP_IF(/*op*/ OP_EQ, /*arg*/ 1, level_script_entry_ar_story),
+     SET_REG(/*value*/ LEVEL_CASTLE_GROUNDS),
+     EXECUTE(/*seg*/ 0x14, /*script*/ _introSegmentRomStart, /*scriptEnd*/ _introSegmentRomEnd, /*entry*/ level_main_scripts_entry),
+     JUMP(level_script_entry),
+@@ -26,3 +30,12 @@ const LevelScript level_script_entry[] = {
+     JUMP(/*target*/ level_script_entry),
+ #endif
+ };
++
++const LevelScript level_script_entry_ar_story[] = {
++    INIT_LEVEL(),
++    SLEEP(/*frames*/ 2),
++    BLACKOUT(/*active*/ FALSE),
++    SET_REG(/*value*/ 0),
++    EXECUTE(/*seg*/ 0x14, /*script*/ _introSegmentRomStart, /*scriptEnd*/ _introSegmentRomEnd, /*entry*/ level_intro_splash_screen),
++    JUMP(/*target*/ level_script_entry),
++};
+diff --git a/levels/intro/script.c b/levels/intro/script.c
+index f5fcbfb..eec0df8 100644
+--- a/levels/intro/script.c
++++ b/levels/intro/script.c
+@@ -18,6 +18,8 @@
+ #include "make_const_nonconst.h"
+ #include "levels/intro/header.h"
+ 
++extern const LevelScript script_intro_ar_start[];
++
+ const LevelScript level_intro_splash_screen[] = {
+     INIT_LEVEL(),
+     FIXED_LOAD(/*loadAddr*/ _goddardSegmentStart, /*romStart*/ _goddardSegmentRomStart, /*romEnd*/ _goddardSegmentRomEnd),
+@@ -64,7 +66,7 @@ const LevelScript level_intro_mario_head_regular[] = {
+     SLEEP(/*frames*/ 20),
+     CALL_LOOP(/*arg*/ 1, /*func*/ lvl_intro_update),
+     // JUMP_IF(/*op*/ OP_EQ, /*arg*/ 100, script_intro_L1),
+-    JUMP_IF(/*op*/ OP_EQ, /*arg*/ 100, script_intro_L4),
++    JUMP_IF(/*op*/ OP_EQ, /*arg*/ 100, script_intro_ar_start),
+     JUMP_IF(/*op*/ OP_EQ, /*arg*/ 101, script_intro_L2),
+     JUMP(script_intro_L4),
+ };
+@@ -90,7 +92,7 @@ const LevelScript level_intro_mario_head_dizzy[] = {
+     SLEEP(/*frames*/ 20),
+     CALL_LOOP(/*arg*/ 2, /*func*/ lvl_intro_update),
+     // JUMP_IF(/*op*/ OP_EQ, /*arg*/ 100, script_intro_L1),
+-    JUMP_IF(/*op*/ OP_EQ, /*arg*/ 100, script_intro_L4),
++    JUMP_IF(/*op*/ OP_EQ, /*arg*/ 100, script_intro_ar_start),
+     JUMP_IF(/*op*/ OP_EQ, /*arg*/ 101, script_intro_L2),
+     JUMP(script_intro_L4),
+ };
+@@ -153,6 +155,13 @@ const LevelScript script_intro_L4[] = {
+     EXIT_AND_EXECUTE(/*seg*/ 0x15, _scriptsSegmentRomStart, _scriptsSegmentRomEnd, level_main_scripts_entry),
+ };
+ 
++/* AR: Start on the title: the story flow opens the file select (vanilla's script_intro_L1); else coopdx's L4. */
++const LevelScript script_intro_ar_start[] = {
++    CALL(/*arg*/ 0, /*func*/ lvl_ar_story),
++    JUMP_IF(/*op*/ OP_EQ, /*arg*/ 1, script_intro_L1),
++    JUMP(script_intro_L4),
++};
++
+ const LevelScript script_intro_L5[] = {
+     STOP_MUSIC(/*fadeOutTime*/ 0x00BE),
+     TRANSITION(/*transType*/ WARP_TRANSITION_FADE_INTO_COLOR, /*time*/ 16, /*color*/ 0x00, 0x00, 0x00),
+diff --git a/src/engine/level_script.c b/src/engine/level_script.c
+index f6c8557..5735526 100644
+--- a/src/engine/level_script.c
++++ b/src/engine/level_script.c
+@@ -15,6 +15,7 @@
+ #include "game/save_file.h"
+ #include "game/sound_init.h"
+ #include "game/level_update.h"
++#include "game/camera.h"
+ #include "goddard/renderer.h"
+ #include "geo_layout.h"
+ #include "graph_node.h"
+@@ -26,6 +27,8 @@
+ #include "surface_collision.h"
+ #include "surface_load.h"
+ #include "level_table.h"
++#include "game/ar_game_hooks.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ #include "pc/lua/utils/smlua_model_utils.h"
+ #include "pc/lua/smlua.h"
+ #include "pc/djui/djui.h"
+@@ -325,6 +328,7 @@ static void level_cmd_load_mio0(void) {
+ }
+ 
+ static void level_cmd_load_mario_head(void) {
++    if (gArMode) { gArScreen = GFX_AR_SCREEN_TITLE; }
+     gSkipInterpolationTitleScreen = true;
+     gGlobalTimer = 0;
+     // TODO: Fix these hardcoded sizes
+@@ -347,6 +351,7 @@ static void level_cmd_load_mio0_texture(void) {
+ }
+ 
+ static void level_cmd_init_level(void) {
++    if (gArMode) { gArLevelInits++; }
+     init_graph_node_start(NULL, (struct GraphNodeStart *) &gObjParentGraphNode);
+     clear_objects();
+     clear_areas();
+@@ -356,6 +361,10 @@ static void level_cmd_init_level(void) {
+ }
+ 
+ static void level_cmd_clear_level(void) {
++    if (gArMode) { gArScreen = GFX_AR_SCREEN_LEVEL; }
++    /* AR: in story the next screen may be a menu or the title; the camera lives in the level pool the next
++     * ALLOC_LEVEL_POOL frees, so drop it (geo_process_camera skips a NULL camera with gArMode, as on the title) */
++    if (gArMode && gArStory) { gCamera = NULL; }
+     clear_objects();
+     clear_area_graph_nodes();
+     clear_areas();
+@@ -763,6 +772,9 @@ static void level_cmd_unload_area(void) {
+     sCurrentCmd = CMD_NEXT;
+ }
+ 
++s16 gArLevelEntryPos[3];
++s8 gArLevelEntryArea;
++
+ static void level_cmd_set_mario_start_pos(void) {
+     s8 areaIndex = CMD_GET(u8, 2);
+ #if IS_64_BIT
+@@ -772,6 +784,11 @@ static void level_cmd_set_mario_start_pos(void) {
+ #else
+     Vec3s pos = { 0 };
+     vec3s_copy(pos, CMD_GET(Vec3s, 6));
++#endif
++#if IS_64_BIT
++    if (gArMode) { vec3s_set(gArLevelEntryPos, x, y, z); gArLevelEntryArea = areaIndex; }
++#else
++    if (gArMode) { vec3s_copy(gArLevelEntryPos, pos); gArLevelEntryArea = areaIndex; }
+ #endif
+     s16 angle = CMD_GET(s16, 4);
+     for (s32 i = 0; i < MAX_PLAYERS; i++) {
+diff --git a/src/game/ar_game_hooks.h b/src/game/ar_game_hooks.h
+index ee452a4..72d8b10 100644
+--- a/src/game/ar_game_hooks.h
++++ b/src/game/ar_game_hooks.h
+@@ -14,7 +14,19 @@ struct ArGameHooks {
+      * levelPos is gMatStack[gMatStackIndex][3], which is level space only because ar_camera_lookat
+      * (rendering_graph_node.c) makes the view the identity in AR mode; if that changes, pass a level-space point. */
+     void (*listener_vector)(f32 out[3], f32 levelPos[3]);
++    /* Called by initiate_warp; 1 = the host handled this warp and nothing else happens. */
++    s32 (*before_warp)(s16 destLevel, s16 destArea, s16 destWarpNode, s32 arg);
++    /* Called where a game over would send Mario to the entry level (initiate_delayed_warp, WARP_OP_GAME_OVER). 1 = the
++     * host handled it and the level change does not happen. */
++    s32 (*game_over)(void);
+ };
+ extern struct ArGameHooks *gArGameHooks;
++/* With gArMode: the level script's MARIO_POS (the level's entry point and its area), recorded on every level load before
++ * any warp moves Mario. Area 0 until a level script sets it. */
++extern s16 gArLevelEntryPos[3];
++extern s8 gArLevelEntryArea;
++extern u32 gArAutoSaveCount;
++extern u8 gArAutoSaveCourse, gArAutoSaveStar;
++void ar_note_auto_save(void);
+ #define AR_GAME_HOOK(name) (gArMode && gArGameHooks != NULL && gArGameHooks->name != NULL)
+ #endif
+diff --git a/src/game/interaction.c b/src/game/interaction.c
+index a102e8c..752ef4a 100644
+--- a/src/game/interaction.c
++++ b/src/game/interaction.c
+@@ -32,6 +32,8 @@
+ #include "pc/network/network.h"
+ #include "pc/network/lag_compensation.h"
+ #include "pc/lua/smlua_hooks.h"
++#include "ar_game_hooks.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ #include "pc/lua/utils/smlua_obj_utils.h"
+ 
+ u8 sDelayInvincTimer;
+@@ -1014,6 +1016,7 @@ u32 interact_star_or_key(struct MarioState *m, UNUSED u32 interactType, struct O
+             return set_mario_action(m, ACT_JUMBO_STAR_CUTSCENE, 0);
+         }
+         save_file_do_save(gCurrSaveFileNum - 1, TRUE);
++        if (gArMode) { ar_note_auto_save(); }
+ 
+         if (noExit && gServerSettings.stayInLevelAfterStar == STAR_NON_STOP) {
+             return TRUE;
+diff --git a/src/game/level_update.c b/src/game/level_update.c
+index 02b8216..b5bd835 100644
+--- a/src/game/level_update.c
++++ b/src/game/level_update.c
+@@ -53,6 +53,7 @@
+ #include "game/screen_transition.h"
+ 
+ #include "engine/level_script.h"
++#include "ar_game_hooks.h"
+ 
+ #define MENU_LEVEL_MIN 0
+ #define MENU_LEVEL_MAX 17
+@@ -768,7 +769,9 @@ s16 music_changed_through_warp(s16 arg) {
+ /**
+  * Set the current warp type and destination level/area/node.
+  */
++static bool sArWarpHandled = false;   /* AR: the last initiate_warp was taken over by gArGameHooks->before_warp */
+ void initiate_warp(s16 destLevel, s16 destArea, s16 destWarpNode, s32 arg) {
++    sArWarpHandled = false;
+     struct WarpDest warpDestOverride = {
+         .levelNum = destLevel,
+         .areaIdx = destArea,
+@@ -779,6 +782,10 @@ void initiate_warp(s16 destLevel, s16 destArea, s16 destWarpNode, s32 arg) {
+         destArea = warpDestOverride.areaIdx;
+         destWarpNode = warpDestOverride.nodeId;
+     }
++    if (AR_GAME_HOOK(before_warp) && gArGameHooks->before_warp(destLevel, destArea, destWarpNode, arg)) {
++        sArWarpHandled = true;
++        return;   /* AR: the host took this warp over */
++    }
+ 
+     if (destWarpNode >= WARP_NODE_CREDITS_MIN) {
+         sWarpDest.type = WARP_TYPE_CHANGE_LEVEL;
+@@ -1053,6 +1060,7 @@ void initiate_delayed_warp(void) {
+         } else {
+             switch (sDelayedWarpOp) {
+                 case WARP_OP_GAME_OVER:
++                    if (AR_GAME_HOOK(game_over) && gArGameHooks->game_over()) { break; }   /* AR: the host handles the game over */
+                     gChangeLevel = gLevelValues.entryLevel;
+                     gMarioStates[0].numLives = 4;
+                     gMarioStates[0].health = 0x880;
+@@ -1114,6 +1122,7 @@ void initiate_delayed_warp(void) {
+                         initiate_warp(warpNode->node.destLevel & 0x7F, warpNode->node.destArea,
+                                         warpNode->node.destNode, sDelayedWarpArg);
+ 
++                        if (sArWarpHandled) { break; }   /* AR: the host warps instead; no checkpoint, no transition */
+                         check_if_should_set_warp_checkpoint(&warpNode->node);
+                         if (sWarpDest.type != WARP_TYPE_CHANGE_LEVEL) {
+                             level_set_transition(2, NULL);
+@@ -1384,6 +1393,12 @@ s32 play_mode_paused(void) {
+             fade_into_special_warp(-9, 1);
+         } else {
+             initiate_warp(gLevelValues.exitCastleLevel, gLevelValues.exitCastleArea, gLevelValues.exitCastleWarpNode, WARP_ARG_EXIT_COURSE);
++            if (sArWarpHandled) {   /* AR: the host took the exit over: unpause, no special warp */
++                raise_background_noise(1);
++                gCameraMovementFlags &= ~CAM_MOVE_PAUSE_SCREEN;
++                set_play_mode(PLAY_MODE_NORMAL);
++                return 0;
++            }
+             fade_into_special_warp(0, 0);
+             gSavedCourseNum = COURSE_NONE;
+         }
+diff --git a/src/game/mario_actions_cutscene.c b/src/game/mario_actions_cutscene.c
+index 9602e64..538a144 100644
+--- a/src/game/mario_actions_cutscene.c
++++ b/src/game/mario_actions_cutscene.c
+@@ -28,6 +28,7 @@
+ #include "sound_init.h"
+ #include "rumble_init.h"
+ #include "obj_behaviors.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ #include "hardcoded.h"
+ #include "libc/stdlib.h"
+ #include "pc/debuglog.h"
+@@ -287,10 +288,12 @@ void handle_save_menu(struct MarioState *m) {
+     if (!m) { return; }
+ 
+     // wait for the menu to show up
+-    if (is_anim_past_end(m) && gSaveOptSelectIndex != 0) {
++    // AR: always save, never ask (the option is preselected by act_exit_land_save_dialog; no animation to wait for)
++    if ((gArMode || is_anim_past_end(m)) && gSaveOptSelectIndex != 0) {
+         // save and continue / save and quit
+         if (gSaveOptSelectIndex == SAVE_OPT_SAVE_AND_CONTINUE /*|| gSaveOptSelectIndex == SAVE_OPT_SAVE_EXIT_GAME || gSaveOptSelectIndex == SAVE_OPT_SAVE_AND_QUIT*/) {
+-            save_file_do_save(gCurrSaveFileNum - 1, FALSE);
++            save_file_do_save(gCurrSaveFileNum - 1, gArMode);
++            if (gArMode) { ar_note_auto_save(); }
+ 
+             /*if (gSaveOptSelectIndex == SAVE_OPT_SAVE_AND_QUIT) {
+                 fade_into_special_warp(-2, 0); // reset game
+@@ -747,13 +750,17 @@ void general_star_dance_handler(struct MarioState *m, s32 isInWater) {
+                 if ((m->actionArg & 1) == 0) {
+                     level_trigger_warp(m, WARP_OP_STAR_EXIT);
+                 } else if (m->playerIndex == 0) {
+-                    if (gBehaviorValues.ShowStarDialog) {
++                    if (gBehaviorValues.ShowStarDialog && !gArMode) {
+                         enable_time_stop_if_alone();
+                         create_dialog_box_with_response((gLastCompletedStarNum == 7)
+                             ? gBehaviorValues.dialogs.HundredCoinsDialog
+                             : gBehaviorValues.dialogs.CollectedStarDialog);
+                         m->actionState = 1;
+                     } else {
++                        if (gArMode) {
++                            save_file_do_save(gCurrSaveFileNum - 1, TRUE);
++                            ar_note_auto_save();
++                        }
+                         m->actionState = 2;
+                     }
+                 } else {
+@@ -1355,12 +1362,12 @@ s32 act_exit_land_save_dialog(struct MarioState *m) {
+             set_character_animation(m, m->actionArg == 0 ? CHAR_ANIM_GENERAL_LAND : CHAR_ANIM_LAND_FROM_SINGLE_JUMP);
+             // only allow for local player
+             if (m == &gMarioStates[0] && is_anim_past_end(m)) {
+-                if (gLastCompletedCourseNum != COURSE_BITDW && gLastCompletedCourseNum != COURSE_BITFS) {
++                if (!gArMode && gLastCompletedCourseNum != COURSE_BITDW && gLastCompletedCourseNum != COURSE_BITFS) {
+                     enable_time_stop_if_alone();
+                 }
+ 
+-                set_menu_mode(RENDER_COURSE_DONE_SCREEN);
+-                gSaveOptSelectIndex = 0;
++                if (!gArMode) { set_menu_mode(RENDER_COURSE_DONE_SCREEN); }
++                gSaveOptSelectIndex = gArMode ? SAVE_OPT_SAVE_AND_CONTINUE : 0;
+ 
+                 m->actionState = 3; // star exit with cap
+                 if (!(m->flags & MARIO_CAP_ON_HEAD)) {
+diff --git a/src/game/rendering_graph_node.c b/src/game/rendering_graph_node.c
+index 734114b..bf285eb 100644
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -942,7 +942,8 @@ static void geo_process_camera(struct GraphNodeCamera *node) {
+ 
+     // compute inverse matrix for lighting engine and fresnel
+     Mat4 invCameraMatrix;
+-    if (mtxf_inverse_non_affine(invCameraMatrix, gCamera->mtx)) {
++    /* AR: the story title runs before any level made a camera (gCamera NULL); upstream never shows it */
++    if ((!gArMode || gCamera != NULL) && mtxf_inverse_non_affine(invCameraMatrix, gCamera->mtx)) {
+         Mtx *invMtx = alloc_display_list(sizeof(Mtx));
+         mtxf_to_mtx(invMtx, invCameraMatrix);
+         gSPMatrix(gDisplayListHead++, invMtx, G_MTX_INVERSE_CAMERA_EXT);
+diff --git a/src/game/save_file.c b/src/game/save_file.c
+index d26e4e6..0a9c6f0 100644
+--- a/src/game/save_file.c
++++ b/src/game/save_file.c
+@@ -17,6 +17,7 @@
+ #include "pc/utils/misc.h"
+ #include "pc/configfile.h"
+ #include "audio/external.h"
++#include "ar_game_hooks.h"
+ 
+ #ifndef bcopy
+ #define bcopy(b1,b2,len) (memmove((b2), (b1), (len)), (void) 0)
+@@ -42,6 +43,13 @@ s8 gSaveFileModified;
+ 
+ u8 gLastCompletedCourseNum = COURSE_NONE;
+ u8 gLastCompletedStarNum = 0;
++u32 gArAutoSaveCount;
++u8 gArAutoSaveCourse, gArAutoSaveStar;
++void ar_note_auto_save(void) {
++    gArAutoSaveCourse = gLastCompletedCourseNum;
++    gArAutoSaveStar = gLastCompletedStarNum;
++    gArAutoSaveCount++;
++}
+ s8 sUnusedGotGlobalCoinHiScore = 0;
+ u8 gGotFileCoinHiScore = FALSE;
+ u8 gCurrCourseStarFlags = 0;
+diff --git a/src/menu/file_select.c b/src/menu/file_select.c
+index 6caef0e..569ceb6 100644
+--- a/src/menu/file_select.c
++++ b/src/menu/file_select.c
+@@ -23,6 +23,7 @@
+ #include "menu/ingame_text.h"
+ 
+ #include "eu_translation.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ #ifdef VERSION_EU
+ #undef LANGUAGE_FUNCTION
+@@ -2864,6 +2865,7 @@ s32 lvl_init_menu_values_and_cursor_pos(UNUSED s32 arg, UNUSED s32 unused) {
+ #ifdef VERSION_EU
+     s8 fileNum;
+ #endif
++    if (gArMode) { gArScreen = GFX_AR_SCREEN_FILE_SELECT; }
+     sSelectedButtonID = MENU_BUTTON_NONE;
+     sCurrentMenuLevel = MENU_LAYER_MAIN;
+     sTextBaseAlpha = 0;
+diff --git a/src/menu/level_select_menu.c b/src/menu/level_select_menu.c
+index ef26e09..66cb882 100644
+--- a/src/menu/level_select_menu.c
++++ b/src/menu/level_select_menu.c
+@@ -16,6 +16,7 @@
+ #include "sm64.h"
+ #include "pc/lua/utils/smlua_level_utils.h"
+ #include "menu/intro_geo.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ #define STUB_LEVEL(textname, _1, _2, _3, _4, _5, _6, _7, _8) textname,
+ #define DEFINE_LEVEL(textname, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10) textname,
+@@ -54,6 +55,7 @@ static char* get_level_stage_names(s16 levelNum) {
+ // the level scripts assume this function is the first, so it cant be moved.
+ s32 run_press_start_demo_timer(s32 timer) {
+     gCurrDemoInput = NULL;
++    if (gArMode && gArStory) { gDemoCountdown = 0; return timer; }   /* AR: no attract demo on the title */
+ 
+     if (timer == 0) {
+         if (!gPlayer1Controller->buttonDown && !gPlayer1Controller->stickMag) {
+@@ -234,6 +236,7 @@ s32 intro_play_its_a_me_mario(void) {
+ 
+ s32 lvl_intro_update(s16 arg1, UNUSED s32 arg2) {
+     s32 retVar = 0;
++    if (gArMode) { gArScreen = GFX_AR_SCREEN_TITLE; }
+ 
+     switch (arg1) {
+         case 0:
+@@ -251,3 +254,5 @@ s32 lvl_intro_update(s16 arg1, UNUSED s32 arg2) {
+     }
+     return retVar;
+ }
++
++s32 lvl_ar_story(UNUSED s16 arg, UNUSED s32 unused) { return gArMode && gArStory; }
+diff --git a/src/menu/level_select_menu.h b/src/menu/level_select_menu.h
+index fcb2b9a..ab14cb8 100644
+--- a/src/menu/level_select_menu.h
++++ b/src/menu/level_select_menu.h
+@@ -6,5 +6,6 @@
+ #include "macros.h"
+ 
+ s32 lvl_intro_update(s16 arg1, UNUSED s32 arg2);
++s32 lvl_ar_story(s16 arg, s32 unused);
+ 
+ #endif // LEVEL_SELECT_MENU_H
+diff --git a/src/menu/star_select.c b/src/menu/star_select.c
+index f3f651e..13f7ed3 100644
+--- a/src/menu/star_select.c
++++ b/src/menu/star_select.c
+@@ -24,6 +24,7 @@
+ #include "pc/network/network.h"
+ #include "pc/lua/utils/smlua_misc_utils.h"
+ #include "engine/math_util.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ #include "game/print.h"
+ #include "game/level_info.h"
+ #include "game/hud.h"
+@@ -220,6 +221,21 @@ void bhv_act_selector_loop(void) {
+     }
+ }
+ 
++s32 ar_act_selector_select(s32 index) {
++    u8 stars = save_file_get_star_flags(gCurrSaveFileNum - 1, gCurrCourseNum - 1);
++    if (index < 0 || index >= sVisibleStars) { return 0; }
++    if (sObtainedStars == 6) { sSelectableStarIndex = index; return 1; }   /* all selectable, as bhv_act_selector_loop */
++    s32 k = 0;
++    for (s32 i = 0; i < sVisibleStars; i++) {
++        if ((stars & (1 << i)) || i + 1 == sInitSelectedActNum) {   /* the loop's rule for a selectable star */
++            if (i == index) { sSelectableStarIndex = k; return 1; }
++            k++;
++        }
++    }
++    return 0;
++}
++s32 ar_act_selector_visible_stars(void) { return sVisibleStars; }
++
+ /**
+  * Print the course number selected with the wood rgba16 course texture.
+  */
+@@ -433,6 +449,7 @@ Gfx *geo_act_selector_strings(s16 callContext, UNUSED struct GraphNode *node) {
+  */
+ s32 lvl_init_act_selector_values_and_stars(UNUSED s32 arg, UNUSED s32 unused) {
+     u8 stars = save_file_get_star_flags(gCurrSaveFileNum - 1, gCurrCourseNum - 1);
++    if (gArMode) { gArScreen = GFX_AR_SCREEN_ACT_SELECT; }
+ 
+     sLoadedActNum = 0;
+     sInitSelectedActNum = 0;
+diff --git a/src/menu/star_select.h b/src/menu/star_select.h
+index da7245e..b2f36a4 100644
+--- a/src/menu/star_select.h
++++ b/src/menu/star_select.h
+@@ -22,5 +22,10 @@ Gfx *geo_act_selector_strings(s16 callContext, UNUSED struct GraphNode *node);
+ #endif
+ s32 lvl_init_act_selector_values_and_stars(UNUSED s32 arg, UNUSED s32 unused);
+ s32 lvl_update_obj_and_load_act_button_actions(UNUSED s32 arg, UNUSED s32 unused);
++/* AR pinch seams. Select visible star `index` (0-based, left to right) as if the stick had moved there: 1 when it is
++ * selectable (collected, or the first not collected; all of them once six are collected), else 0 and nothing changes.
++ * ar_act_selector_visible_stars: how many stars the selector shows. */
++s32 ar_act_selector_select(s32 index);
++s32 ar_act_selector_visible_stars(void);
+ 
+ #endif // STAR_SELECT_H
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index 2a50957..844645c 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -57,6 +57,14 @@ extern bool gArPackFloorTilt;
+ /* With gArMode: the cannon the local Mario aims from stays drawn and its barrel follows the aim (default on); off: vanilla
+  * (hidden while aiming). It changes object state (the cannon's angles), so the adapter records it with the setup. */
+ extern bool gArCannonVisible;
++/* story mode. gArStory: the title screen, the file select, the act selector and the vanilla game flow run (the entry
++ * script, Start, the attract demo; default false, only the host sets it). gArScreen: what is up, set by the scripts with
++ * gArMode (title, file select, act selector, cake) and back to LEVEL by CLEAR_LEVEL. */
++extern bool gArStory;
++enum { GFX_AR_SCREEN_LEVEL = 0, GFX_AR_SCREEN_TITLE = 1, GFX_AR_SCREEN_FILE_SELECT = 2, GFX_AR_SCREEN_ACT_SELECT = 3,
++       GFX_AR_SCREEN_CAKE = 4 };
++extern int gArScreen;
++extern unsigned gArLevelInits;
+ 
+ /* Game code: emit a tag into the display list being built. No-op unless gArMode. */
+ #define GFX_AR_EMIT_TAG(kind, arg) do { if (gArMode) { gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(kind, arg)); } } while (0)
+diff --git a/src/pc/gfx/gfx_pc.c b/src/pc/gfx/gfx_pc.c
+index 1e2ee6e..3228f26 100644
+--- a/src/pc/gfx/gfx_pc.c
++++ b/src/pc/gfx/gfx_pc.c
+@@ -126,6 +126,9 @@ static f32 sDepthZSub = 0;
+ struct GfxArHooks *gGfxArHooks = NULL;
+ bool gArMode = false;
+ bool gArDynosPacksOnly = false;
++bool gArStory = false;
++int gArScreen = GFX_AR_SCREEN_LEVEL;
++unsigned gArLevelInits = 0;
+ /* gArDynosPacksOnly: pack display lists are validated on the Mac (scripts/packs.py); these bounds are the device's
+    second line. Commands one frame may execute and the G_DL push nesting; far above anything vanilla or a pack draws. */
+ #define GFX_AR_DL_MAX_COMMANDS (1u << 22)

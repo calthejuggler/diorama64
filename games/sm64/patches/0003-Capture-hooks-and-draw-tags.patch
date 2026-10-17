@@ -1,0 +1,513 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Capture hooks and draw tags
+
+Adds the renderer side of the AR capture: a hook table (gGfxArHooks, NULL by
+default, in src/pc/gfx/gfx_ar_hooks.h) and G_NOOP tag words ("AR" in the high
+16 bits, then kind and argument) that the game emits into its display lists.
+
+- gfx_pc: WORLD draws reach the capture backend in level space, without
+  projection, aspect correction, clip reject, CPU backface culling or fog;
+  the cull mode is reported instead. Rectangles stay SCREEN. The host can
+  set the rotation used for light and texgen directions (the lighting
+  camera), so models are lit from the viewer's head.
+- the game (with gArMode) brackets camera-space nodes with WORLD tags, the 2D
+  passes with overlay group tags (misc, counters, power meter, dialog,
+  pause) and each player's own display lists with FOCUS tags
+  for an x-ray silhouette; the background node draws neither skybox nor
+  fill colour and frame/viewport clears emit nothing.
+
+With gGfxArHooks == NULL and gArMode == false the renderer and the game
+behave exactly like upstream.
+---
+ src/engine/graph_node.h         |  1 +
+ src/game/area.c                 |  3 ++
+ src/game/game_init.c            |  3 ++
+ src/game/hud.c                  |  5 +++
+ src/game/ingame_menu.c          |  6 +++
+ src/game/rendering_graph_node.c | 36 +++++++++++++++
+ src/pc/gfx/gfx_ar_hooks.h       | 30 +++++++++++++
+ src/pc/gfx/gfx_pc.c             | 80 ++++++++++++++++++++++++++++++---
+ 8 files changed, 158 insertions(+), 6 deletions(-)
+
+diff --git a/src/engine/graph_node.h b/src/engine/graph_node.h
+index 7e61e9f..b04e6f7 100644
+--- a/src/engine/graph_node.h
++++ b/src/engine/graph_node.h
+@@ -134,6 +134,7 @@ struct DisplayListNode
+     Gfx *displayList;
+     struct DisplayListNode *next;
+     u8 usingCamSpace;
++    u8 arFocus;   /* AR: 0, or player index + 1 when the list is that player's own geometry (silhouette) */
+ };
+ 
+ /** GraphNode that manages the 8 top-level display lists that will be drawn
+diff --git a/src/game/area.c b/src/game/area.c
+index 003ec16..1f94712 100644
+--- a/src/game/area.c
++++ b/src/game/area.c
+@@ -30,6 +30,7 @@
+ #include "pc/djui/djui_panel_pause.h"
+ #include "pc/nametags.h"
+ #include "engine/lighting_engine.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ struct SpawnInfo gPlayerSpawnInfos[MAX_PLAYERS];
+ struct Area gAreaData[MAX_AREAS];
+@@ -450,6 +451,7 @@ void render_game(void) {
+     dynos_update_gfx();
+     if (gCurrentArea != NULL && !gWarpTransition.pauseRendering) {
+         geo_process_root(gCurrentArea->root, gViewportOverride, gViewportClip, gFBSetColor);
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_MISC);
+ 
+         gSPViewport(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(&gViewportFullscreen));
+ 
+@@ -503,6 +505,7 @@ void render_game(void) {
+                 gWarpTransDelay--;
+             }
+         }
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_MISC);
+     } else {
+         // this will get drawn over anyways
+         smlua_call_event_hooks(HOOK_ON_HUD_RENDER_BEHIND, djui_reset_hud_params);
+diff --git a/src/game/game_init.c b/src/game/game_init.c
+index 8db064c..8020df2 100644
+--- a/src/game/game_init.c
++++ b/src/game/game_init.c
+@@ -26,6 +26,7 @@
+ #include <prevent_bss_reordering.h>
+ #include "bettercamera.h"
+ #include "hud.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ #include "pc/controller/controller_mouse.h"
+ 
+ // FIXME: I'm not sure all of these variables belong in this file, but I don't
+@@ -147,6 +148,7 @@ void display_frame_buffer(void) {
+ 
+ /** Clears the framebuffer, allowing it to be overwritten. */
+ void clear_frame_buffer(s32 color) {
++    if (gArMode) { return; }
+     gDPPipeSync(gDisplayListHead++);
+ 
+     gDPSetRenderMode(gDisplayListHead++, G_RM_OPA_SURF, G_RM_OPA_SURF2);
+@@ -164,6 +166,7 @@ void clear_frame_buffer(s32 color) {
+ 
+ /** Clears and initializes the viewport. */
+ void clear_viewport(Vp *viewport, s32 color) {
++    if (gArMode) { return; }
+     s16 vpUlx = (viewport->vp.vtrans[0] - viewport->vp.vscale[0]) / 4 + 1;
+     s16 vpUly = (viewport->vp.vtrans[1] - viewport->vp.vscale[1]) / 4 + 1;
+     s16 vpLrx = (viewport->vp.vtrans[0] + viewport->vp.vscale[0]) / 4 - 2;
+diff --git a/src/game/hud.c b/src/game/hud.c
+index 1e16413..95fb4cd 100644
+--- a/src/game/hud.c
++++ b/src/game/hud.c
+@@ -24,6 +24,7 @@
+ #include "pc/lua/smlua.h"
+ #include "pc/lua/utils/smlua_obj_utils.h"
+ #include "data/dynos_mgr_builtin_externs.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ extern bool gDjuiInMainMenu;
+ u8 gOverrideHideHud;
+@@ -622,6 +623,7 @@ void render_hud(void) {
+ #else
+         create_dl_ortho_matrix();
+ #endif
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_COUNTERS);
+ 
+         bool showHud = (!gDjuiInMainMenu && !gOverrideHideHud);
+ 
+@@ -660,12 +662,15 @@ void render_hud(void) {
+             }
+ 
+             if (hudDisplayFlags & HUD_DISPLAY_FLAG_POWER && showHud) {
++                GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_POWER_METER);
+                 render_hud_power_meter();
++                GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_POWER_METER);
+             }
+         }
+ 
+         if (hudDisplayFlags & HUD_DISPLAY_FLAG_TIMER && showHud) {
+             render_hud_timer();
+         }
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_COUNTERS);
+     }
+ }
+diff --git a/src/game/ingame_menu.c b/src/game/ingame_menu.c
+index ac984fa..8c9a3f7 100644
+--- a/src/game/ingame_menu.c
++++ b/src/game/ingame_menu.c
+@@ -39,6 +39,7 @@
+ #include "pc/lua/utils/smlua_text_utils.h"
+ #include "menu/ingame_text.h"
+ #include "pc/dialog_table.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ u16 gDialogColorFadeTimer;
+ s8 gLastDialogLineNum;
+@@ -3423,6 +3424,7 @@ s16 render_menus_and_dialogs(void) {
+     create_dl_ortho_matrix();
+ 
+     if (gMenuMode != -1) {
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_PAUSE);
+         gPrevMenuMode = gMenuMode;
+         switch (gMenuMode) {
+             case 0:
+@@ -3440,15 +3442,19 @@ s16 render_menus_and_dialogs(void) {
+         }
+ 
+         gDialogColorFadeTimer = (s16) gDialogColorFadeTimer + 0x1000;
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_PAUSE);
+     } else if (gDialogID != DIALOG_NONE) {
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_DIALOG);
+         // The Peach "Dear Mario" message needs to be repositioned separately
+         if (gDialogID == DIALOG_020) {
+             print_peach_letter_message();
++            GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_DIALOG);
+             return mode;
+         }
+ 
+         render_dialog_entries();
+         gDialogColorFadeTimer = (s16) gDialogColorFadeTimer + 0x1000;
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_DIALOG);
+     }
+     return mode;
+ }
+diff --git a/src/game/rendering_graph_node.c b/src/game/rendering_graph_node.c
+index 97925f7..b2139b4 100644
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -22,6 +22,7 @@
+ #include "skybox.h"
+ #include "mario.h"
+ #include "hardcoded.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ /**
+  * This file contains the code that processes the scene graph for rendering.
+@@ -246,6 +247,14 @@ static struct GrowingArray* sMtxTbl = NULL;
+ 
+ struct Object* gCurGraphNodeProcessingObject = NULL;
+ struct MarioState* gCurGraphNodeMarioState = NULL;
++static s32 sArNoFocus = FALSE;   /* AR: set while a player's blob shadow is appended (not part of the silhouette) */
++/* AR: player i's own geometry is tagged for the x-ray silhouette; held objects and the shadow are not. */
++static u8 ar_focus_owner(void) {
++    if (!gArMode || sArNoFocus || gCurGraphNodeHeldObject != NULL) { return 0; }
++    /* not gCurGraphNodeMarioState: it is only set for GRAPH_RENDER_PLAYER objects, which stock Mario is not */
++    struct MarioState *m = get_mario_state_from_object(gCurGraphNodeProcessingObject);
++    return (m == NULL) ? 0 : (u8)(m->playerIndex + 1);
++}
+ 
+ f32 gOverrideFOV = 0;
+ f32 gOverrideNear = 0;
+@@ -517,6 +526,8 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+     s32 enableZBuffer = (node->node.flags & GRAPH_RENDER_Z_BUFFER) != 0;
+     struct RenderModeContainer *modeList = &renderModeTable_1Cycle[enableZBuffer];
+     struct RenderModeContainer *mode2List = &renderModeTable_2Cycle[enableZBuffer];
++    s32 arSpace = -1;
++    s32 arFocus = 0;
+ 
+     // @bug This is where the LookAt values should be calculated but aren't.
+     // As a result, environment mapping is broken on Fast3DEX2 without the
+@@ -535,6 +546,17 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+         if ((currList = node->listHeads[i]) != NULL) {
+             gDPSetRenderMode(gDisplayListHead++, modeList->modes[i], mode2List->modes[i]);
+             while (currList != NULL) {
++                if (gArMode) {
++                    s32 want = currList->usingCamSpace ? GFX_AR_SPACE_WORLD : GFX_AR_SPACE_SCREEN;
++                    if (want != arSpace) {
++                        gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_SPACE, want));
++                        arSpace = want;
++                    }
++                }
++                if (gArMode && currList->arFocus != arFocus) {
++                    gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_FOCUS, currList->arFocus));
++                    arFocus = currList->arFocus;
++                }
+                 detect_and_skip_mtx_interpolation(&currList->transform, &currList->transformPrev);
+ 
+                 struct MtxInterp *interp = growing_array_alloc(sMtxTbl, sizeof(struct MtxInterp));
+@@ -553,6 +575,12 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+             }
+         }
+     }
++    if (arFocus != 0) {
++        gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_FOCUS, 0));
++    }
++    if (arSpace == GFX_AR_SPACE_WORLD) {
++        gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_SPACE, GFX_AR_SPACE_SCREEN));
++    }
+     if (enableZBuffer != 0) {
+         gDPPipeSync(gDisplayListHead++);
+         gSPClearGeometryMode(gDisplayListHead++, G_ZBUFFER);
+@@ -577,6 +605,7 @@ static void geo_append_display_list(void *displayList, s16 layer) {
+         listNode->displayList = displayList;
+         listNode->next = 0;
+         listNode->usingCamSpace = sUsingCamSpace;
++        listNode->arFocus = ar_focus_owner();
+         if (gCurGraphNodeMasterList->listHeads[layer] == 0) {
+             gCurGraphNodeMasterList->listHeads[layer] = listNode;
+         } else {
+@@ -1061,6 +1090,11 @@ static void geo_process_generated_list(struct GraphNodeGenerated *node) {
+ static void geo_process_background(struct GraphNodeBackground *node) {
+     Gfx *list = NULL;
+ 
++    if (gArMode) {   /* AR: no skybox and no background fill; the room is the background */
++        if (node->fnNode.node.children != NULL) { geo_process_node_and_siblings(node->fnNode.node.children); }
++        return;
++    }
++
+     if (node->fnNode.func != NULL) {
+         Vec3f posCopy;
+         Vec3f focusCopy;
+@@ -1381,6 +1415,7 @@ static void geo_process_shadow(struct GraphNodeShadow *node) {
+             // Increment the matrix stack, If we fail to do so. Just return.
+             if (!increment_mat_stack()) { return; }
+ 
++            sArNoFocus = TRUE;
+             if (gShadowAboveWaterOrLava == TRUE) {
+                 geo_append_display_list((void *) VIRTUAL_TO_PHYSICAL(shadowListPrev), 4);
+             } else if (gMarioOnIceOrCarpet == TRUE) {
+@@ -1388,6 +1423,7 @@ static void geo_process_shadow(struct GraphNodeShadow *node) {
+             } else {
+                 geo_append_display_list((void *) VIRTUAL_TO_PHYSICAL(shadowListPrev), 6);
+             }
++            sArNoFocus = FALSE;
+             gMatStackIndex--;
+         }
+     }
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index e69de29..6a18656 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -0,0 +1,30 @@
++#ifndef GFX_AR_HOOKS_H
++#define GFX_AR_HOOKS_H
++/* AR seams. With gGfxArHooks == NULL and gArMode == false, gfx_pc and the game behave exactly like upstream. */
++#include <stdbool.h>
++#include <stdint.h>
++
++/* G_NOOP tag word: "AR" in the high 16 bits, kind in bits 8..15, argument in bits 0..7. */
++#define GFX_AR_TAG_MAGIC 0x41520000u
++#define GFX_AR_TAG(kind, arg) (GFX_AR_TAG_MAGIC | (((uint32_t)(kind) & 0xFFu) << 8) | ((uint32_t)(arg) & 0xFFu))
++enum { GFX_AR_TAG_SPACE = 1, GFX_AR_TAG_GROUP_BEGIN = 2, GFX_AR_TAG_GROUP_END = 3, GFX_AR_TAG_FOCUS = 4 };
++enum { GFX_AR_SPACE_SCREEN = 0, GFX_AR_SPACE_WORLD = 1, GFX_AR_SPACE_DISCARD = 2 };
++enum { GFX_AR_CULL_NONE = 0, GFX_AR_CULL_BACK = 1, GFX_AR_CULL_FRONT = 2 };
++enum { GFX_AR_GROUP_MISC = 1, GFX_AR_GROUP_COUNTERS = 2, GFX_AR_GROUP_POWER_METER = 3,
++       GFX_AR_GROUP_DIALOG = 4, GFX_AR_GROUP_PAUSE = 5 };
++
++struct GfxArHooks {
++    void (*set_space)(int space);      /* GFX_AR_SPACE_*, after the pending batch was flushed */
++    void (*set_cull)(int cull);         /* GFX_AR_CULL_*, WORLD only, after a flush */
++    void (*group)(int begin, int id);   /* overlay group BEGIN (1) / END (0), after a flush */
++    void (*focus)(int owner);           /* FOCUS tag: 0, or player index + 1 (x-ray silhouette owner), after a flush */
++};
++extern struct GfxArHooks *gGfxArHooks;   /* NULL = upstream behaviour */
++extern bool gArMode;
++
++/* Game code: emit a tag into the display list being built. No-op unless gArMode. */
++#define GFX_AR_EMIT_TAG(kind, arg) do { if (gArMode) { gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(kind, arg)); } } while (0)
++/* Lighting camera: rotation used for lights and texgen of WORLD draws. */
++void gfx_ar_set_shading_view(const float m[4][4]);
++void gfx_ar_clear_shading_view(void);
++#endif
+diff --git a/src/pc/gfx/gfx_pc.c b/src/pc/gfx/gfx_pc.c
+index 6563430..799ab29 100644
+--- a/src/pc/gfx/gfx_pc.c
++++ b/src/pc/gfx/gfx_pc.c
+@@ -38,6 +38,7 @@
+ #include "pc/gfx/gfx_rendering_api.h"
+ #include "pc/gfx/gfx_screen_config.h"
+ #include "pc/gfx/gfx_window_manager_api.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ #define G_TX_LOADTILE_6_UNKNOWN 6
+ 
+@@ -122,6 +123,15 @@ static struct GfxRenderingAPI *gfx_rapi = NULL;
+ static f32 sDepthZAdd = 0;
+ static f32 sDepthZMult = 1;
+ static f32 sDepthZSub = 0;
++struct GfxArHooks *gGfxArHooks = NULL;
++bool gArMode = false;
++static int sArSpace = GFX_AR_SPACE_SCREEN;
++static int sArCull = -1;
++static inline bool gfx_ar_world(void) { return gGfxArHooks != NULL && sArSpace == GFX_AR_SPACE_WORLD; }
++static Mat4 sArShadingView;
++static bool sArHasShadingView = false;
++void gfx_ar_set_shading_view(const float m[4][4]) { memcpy(sArShadingView, m, sizeof(sArShadingView)); sArHasShadingView = true; }
++void gfx_ar_clear_shading_view(void) { sArHasShadingView = false; }
+ 
+ Vec3f gLightingDir = { 0.0f, 0.0f, 0.0f };
+ Color gLightingColor[2] = { { 0xFF, 0xFF, 0xFF }, { 0xFF, 0xFF, 0xFF } };
+@@ -655,10 +665,25 @@ static void calculate_normal_dir(const Light_t *light, Vec3f coeffs, bool applyL
+         light_dir[2] += gLightingDir[2];
+     }
+ 
+-    gfx_transposed_matrix_mul(coeffs, light_dir, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
++    if (gfx_ar_world() && sArHasShadingView) {
++        Mat4 mvs;
++        mtxf_mul(mvs, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], sArShadingView);
++        gfx_transposed_matrix_mul(coeffs, light_dir, mvs);
++    } else {
++        gfx_transposed_matrix_mul(coeffs, light_dir, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
++    }
+     vec3f_normalize(coeffs);
+ }
+ 
++/* WORLD: vertices leave the vertex stage in level space (model matrix only, no projection). */
++static void gfx_ar_update_mp(void) {
++    if (gfx_ar_world()) {
++        mtxf_copy(rsp.MP_matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
++    } else {
++        mtxf_mul(rsp.MP_matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], rsp.P_matrix);
++    }
++}
++
+ static void OPTIMIZE_O3 gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
+ 
+     Mat4 matrix;
+@@ -705,7 +730,7 @@ static void OPTIMIZE_O3 gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
+         }
+         rsp.lights_changed = 1;
+     }
+-    mtxf_mul(rsp.MP_matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], rsp.P_matrix);
++    gfx_ar_update_mp();
+ }
+ 
+ static void gfx_sp_pop_matrix(uint32_t count) {
+@@ -713,7 +738,7 @@ static void gfx_sp_pop_matrix(uint32_t count) {
+         if (rsp.modelview_matrix_stack_size > 0) {
+             --rsp.modelview_matrix_stack_size;
+             if (rsp.modelview_matrix_stack_size > 0) {
+-                mtxf_mul(rsp.MP_matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], rsp.P_matrix);
++                gfx_ar_update_mp();
+             }
+         }
+     }
+@@ -813,7 +838,7 @@ static void OPTIMIZE_O3 gfx_sp_vertex(size_t n_vertices, size_t dest_index, cons
+         float w = v->ob[0] * rsp.MP_matrix[0][3] + v->ob[1] * rsp.MP_matrix[1][3] + v->ob[2] * rsp.MP_matrix[2][3] + rsp.MP_matrix[3][3];
+ #endif
+ 
+-        x = gfx_adjust_x_for_aspect_ratio(x);
++        if (!gfx_ar_world()) { x = gfx_adjust_x_for_aspect_ratio(x); }
+ 
+         short U = v->tc[0] * rsp.texture_scaling_factor.s >> 16;
+         short V = v->tc[1] * rsp.texture_scaling_factor.t >> 16;
+@@ -1029,13 +1054,14 @@ static void OPTIMIZE_O3 gfx_sp_vertex(size_t n_vertices, size_t dest_index, cons
+         if (y > w) d->clip_rej |= 8;
+         if (z < -w) d->clip_rej |= 16;
+         if (z > w) d->clip_rej |= 32;
++        if (gfx_ar_world()) { d->clip_rej = 0; }
+ 
+         d->x = x;
+         d->y = y;
+         d->z = z;
+         d->w = w;
+ 
+-        if (rsp.geometry_mode & G_FOG) {
++        if ((rsp.geometry_mode & G_FOG) && !gfx_ar_world()) {
+             if (fabsf(w) < 0.001f) {
+                 // To avoid division by zero
+                 w = 0.001f;
+@@ -1064,6 +1090,21 @@ static void OPTIMIZE_O3 gfx_sp_vertex(size_t n_vertices, size_t dest_index, cons
+     }
+ }
+ 
++static void gfx_ar_report_cull(void) {
++    int cull = GFX_AR_CULL_NONE;
++    uint32_t mode = rsp.geometry_mode & G_CULL_BOTH;
++    if (mode == G_CULL_BACK) { cull = GFX_AR_CULL_BACK; }
++    else if (mode == G_CULL_FRONT) { cull = GFX_AR_CULL_FRONT; }   /* G_CULL_BOTH stays NONE (upstream hack) */
++    if (cull != GFX_AR_CULL_NONE && (rsp.geometry_mode & G_CULL_INVERT_EXT)) {
++        cull = (cull == GFX_AR_CULL_BACK) ? GFX_AR_CULL_FRONT : GFX_AR_CULL_BACK;
++    }
++    if (cull != sArCull) {
++        gfx_flush();
++        sArCull = cull;
++        if (gGfxArHooks->set_cull) { gGfxArHooks->set_cull(cull); }
++    }
++}
++
+ static void OPTIMIZE_O3 gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
+     struct GfxVertex *v1 = &rsp.loaded_vertices[vtx1_idx];
+     struct GfxVertex *v2 = &rsp.loaded_vertices[vtx2_idx];
+@@ -1075,7 +1116,9 @@ static void OPTIMIZE_O3 gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t
+         return;
+     }
+ 
+-    if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
++    if (gfx_ar_world()) {
++        gfx_ar_report_cull();
++    } else if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
+         float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
+         float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
+         float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
+@@ -1156,6 +1199,7 @@ static void OPTIMIZE_O3 gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t
+     cm->use_fog        = (rdp.other_mode_l >> 30)                       == G_BL_CLR_FOG;
+     cm->light_map      = (rsp.geometry_mode & G_LIGHT_MAP_EXT)          == G_LIGHT_MAP_EXT;
+     cm->world_geometry = gShaderFlagsEnabled && (v1->world_geometry && v2->world_geometry && v3->world_geometry);
++    if (gfx_ar_world()) { cm->use_fog = false; }
+ 
+     if (cm->texture_edge) {
+         cm->use_alpha = true;
+@@ -1629,6 +1673,9 @@ static void gfx_dp_set_fill_color(uint32_t packed_color) {
+ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
+     uint32_t saved_other_mode_h = rdp.other_mode_h;
+     uint32_t cycle_type = (rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE));
++    int arSaved = sArSpace;
++    bool arSwap = gGfxArHooks != NULL && arSaved != GFX_AR_SPACE_SCREEN;
++    if (arSwap) { gfx_flush(); sArSpace = GFX_AR_SPACE_SCREEN; if (gGfxArHooks->set_space) { gGfxArHooks->set_space(sArSpace); } }
+ 
+     if (cycle_type == G_CYC_COPY) {
+         rdp.other_mode_h = (rdp.other_mode_h & ~(3U << G_MDSFT_TEXTFILT)) | G_TF_POINT;
+@@ -1684,6 +1731,7 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
+ 
+     gfx_sp_tri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 3);
+     gfx_sp_tri1(MAX_VERTICES + 1, MAX_VERTICES + 2, MAX_VERTICES + 3);
++    if (arSwap) { gfx_flush(); sArSpace = arSaved; if (gGfxArHooks->set_space) { gGfxArHooks->set_space(sArSpace); } }
+ 
+     rsp.geometry_mode = geometry_mode_saved;
+     rdp.viewport = viewport_saved;
+@@ -1807,6 +1855,22 @@ static inline void *seg_addr(uintptr_t w1) {
+ #define C0(pos, width) ((cmd->words.w0 >> (pos)) & ((1U << width) - 1))
+ #define C1(pos, width) ((cmd->words.w1 >> (pos)) & ((1U << width) - 1))
+ 
++static void gfx_ar_noop(uintptr_t w1) {
++    if (gGfxArHooks == NULL || (w1 >> 16) != (GFX_AR_TAG_MAGIC >> 16)) { return; }
++    uint32_t kind = (uint32_t)(w1 >> 8) & 0xFFu, arg = (uint32_t)w1 & 0xFFu;
++    gfx_flush();
++    if (kind == GFX_AR_TAG_SPACE) {
++        sArSpace = (int)arg;
++        gfx_ar_update_mp();
++        rsp.lights_changed = true;
++        if (gGfxArHooks->set_space) { gGfxArHooks->set_space((int)arg); }
++    } else if (kind == GFX_AR_TAG_GROUP_BEGIN || kind == GFX_AR_TAG_GROUP_END) {
++        if (gGfxArHooks->group) { gGfxArHooks->group(kind == GFX_AR_TAG_GROUP_BEGIN, (int)arg); }
++    } else if (kind == GFX_AR_TAG_FOCUS) {
++        if (gGfxArHooks->focus) { gGfxArHooks->focus((int)arg); }
++    }
++}
++
+ static void OPTIMIZE_O3 gfx_run_dl(Gfx* cmd) {
+     if (!cmd) { return; }
+ 
+@@ -1829,6 +1893,9 @@ static void OPTIMIZE_O3 gfx_run_dl(Gfx* cmd) {
+                 gfx_sp_pop_matrix(1);
+ #endif
+                 break;
++            case G_NOOP:
++                gfx_ar_noop(cmd->words.w1);
++                break;
+             case G_MOVEMEM:
+ #ifdef F3DEX_GBI_2
+                 gfx_sp_movemem(C0(0, 8), C0(8, 8) * 8, seg_addr(cmd->words.w1));
+@@ -2100,6 +2167,7 @@ void gfx_start_frame(void) {
+ }
+ 
+ void gfx_run(Gfx *commands) {
++    sArSpace = GFX_AR_SPACE_SCREEN;
+     gfx_sp_reset();
+ 
+     sHasInverseCameraMatrix = false;

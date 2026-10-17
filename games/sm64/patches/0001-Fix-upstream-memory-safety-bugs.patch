@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Fix upstream memory-safety bugs
+
+Upstream bugs found with AddressSanitizer, fixed for every build mode:
+- background_gamepad is a bool registered in the config table as a uint, so
+  saving read 4 bytes and loading wrote 4 bytes through sscanf;
+- patch_mtx_interpolated used camera-space matrix buffers after their scope
+  ended;
+- rom_assets_decompress read the MIO0 magic past the end of a segment shorter
+  than its header;
+- eight hoot display lists loaded 12 vertices from 6-vertex arrays. Their
+  triangles only use vertices 0-5, so loading 6 draws the same pixels without
+  the over-read.
+---
+ actors/hoot/model.inc.c         | 16 ++++++++--------
+ src/audio/ar_audio_hooks.h      |  0
+ src/game/ar_game_hooks.h        |  0
+ src/game/rendering_graph_node.c |  2 +-
+ src/goddard/ar_goddard.h        |  0
+ src/pc/configfile.c             |  6 +++---
+ src/pc/gfx/gfx_ar_hooks.h       |  0
+ src/pc/rom_assets.c             |  3 +++
+ 8 files changed, 15 insertions(+), 12 deletions(-)
+ create mode 100644 src/audio/ar_audio_hooks.h
+ create mode 100644 src/game/ar_game_hooks.h
+ create mode 100644 src/goddard/ar_goddard.h
+ create mode 100644 src/pc/gfx/gfx_ar_hooks.h
+
+diff --git a/actors/hoot/model.inc.c b/actors/hoot/model.inc.c
+index ef096c2..f7386cd 100644
+--- a/actors/hoot/model.inc.c
++++ b/actors/hoot/model.inc.c
+@@ -215,7 +215,7 @@ const Gfx hoot_seg5_dl_05002EB0[] = {
+     gsDPSetTileSize(0, 0, 0, (32 - 1) << G_TEXTURE_IMAGE_FRAC, (32 - 1) << G_TEXTURE_IMAGE_FRAC),
+     gsSPLight(&hoot_seg5_lights_05001E38.l, 1),
+     gsSPLight(&hoot_seg5_lights_05001E38.a, 2),
+-    gsSPVertex(hoot_seg5_vertex_05002E50, 12, 0),
++    gsSPVertex(hoot_seg5_vertex_05002E50, 6, 0),
+     gsSP2Triangles( 0,  1,  2, 0x0,  3,  4,  5, 0x0),
+     gsSPEndDisplayList(),
+ };
+@@ -261,7 +261,7 @@ const Gfx hoot_seg5_dl_05002FD8[] = {
+     gsDPSetTileSize(0, 0, 0, (32 - 1) << G_TEXTURE_IMAGE_FRAC, (32 - 1) << G_TEXTURE_IMAGE_FRAC),
+     gsSPLight(&hoot_seg5_lights_05002F60.l, 1),
+     gsSPLight(&hoot_seg5_lights_05002F60.a, 2),
+-    gsSPVertex(hoot_seg5_vertex_05002F78, 12, 0),
++    gsSPVertex(hoot_seg5_vertex_05002F78, 6, 0),
+     gsSP2Triangles( 0,  1,  2, 0x0,  3,  4,  5, 0x0),
+     gsSPEndDisplayList(),
+ };
+@@ -307,7 +307,7 @@ const Gfx hoot_seg5_dl_05003100[] = {
+     gsDPSetTileSize(0, 0, 0, (32 - 1) << G_TEXTURE_IMAGE_FRAC, (32 - 1) << G_TEXTURE_IMAGE_FRAC),
+     gsSPLight(&hoot_seg5_lights_05003088.l, 1),
+     gsSPLight(&hoot_seg5_lights_05003088.a, 2),
+-    gsSPVertex(hoot_seg5_vertex_050030A0, 12, 0),
++    gsSPVertex(hoot_seg5_vertex_050030A0, 6, 0),
+     gsSP2Triangles( 0,  1,  2, 0x0,  3,  4,  5, 0x0),
+     gsSPEndDisplayList(),
+ };
+@@ -353,7 +353,7 @@ const Gfx hoot_seg5_dl_05003228[] = {
+     gsDPSetTileSize(0, 0, 0, (32 - 1) << G_TEXTURE_IMAGE_FRAC, (32 - 1) << G_TEXTURE_IMAGE_FRAC),
+     gsSPLight(&hoot_seg5_lights_050031B0.l, 1),
+     gsSPLight(&hoot_seg5_lights_050031B0.a, 2),
+-    gsSPVertex(hoot_seg5_vertex_050031C8, 12, 0),
++    gsSPVertex(hoot_seg5_vertex_050031C8, 6, 0),
+     gsSP2Triangles( 0,  1,  2, 0x0,  3,  4,  5, 0x0),
+     gsSPEndDisplayList(),
+ };
+@@ -399,7 +399,7 @@ const Gfx hoot_seg5_dl_05003350[] = {
+     gsDPSetTileSize(0, 0, 0, (32 - 1) << G_TEXTURE_IMAGE_FRAC, (32 - 1) << G_TEXTURE_IMAGE_FRAC),
+     gsSPLight(&hoot_seg5_lights_050032D8.l, 1),
+     gsSPLight(&hoot_seg5_lights_050032D8.a, 2),
+-    gsSPVertex(hoot_seg5_vertex_050032F0, 12, 0),
++    gsSPVertex(hoot_seg5_vertex_050032F0, 6, 0),
+     gsSP2Triangles( 0,  1,  2, 0x0,  3,  4,  5, 0x0),
+     gsSPEndDisplayList(),
+ };
+@@ -445,7 +445,7 @@ const Gfx hoot_seg5_dl_05003478[] = {
+     gsDPSetTileSize(0, 0, 0, (32 - 1) << G_TEXTURE_IMAGE_FRAC, (32 - 1) << G_TEXTURE_IMAGE_FRAC),
+     gsSPLight(&hoot_seg5_lights_05003400.l, 1),
+     gsSPLight(&hoot_seg5_lights_05003400.a, 2),
+-    gsSPVertex(hoot_seg5_vertex_05003418, 12, 0),
++    gsSPVertex(hoot_seg5_vertex_05003418, 6, 0),
+     gsSP2Triangles( 0,  1,  2, 0x0,  3,  4,  5, 0x0),
+     gsSPEndDisplayList(),
+ };
+@@ -491,7 +491,7 @@ const Gfx hoot_seg5_dl_050035A0[] = {
+     gsDPSetTileSize(0, 0, 0, (32 - 1) << G_TEXTURE_IMAGE_FRAC, (32 - 1) << G_TEXTURE_IMAGE_FRAC),
+     gsSPLight(&hoot_seg5_lights_05003528.l, 1),
+     gsSPLight(&hoot_seg5_lights_05003528.a, 2),
+-    gsSPVertex(hoot_seg5_vertex_05003540, 12, 0),
++    gsSPVertex(hoot_seg5_vertex_05003540, 6, 0),
+     gsSP2Triangles( 0,  1,  2, 0x0,  3,  4,  5, 0x0),
+     gsSPEndDisplayList(),
+ };
+@@ -537,7 +537,7 @@ const Gfx hoot_seg5_dl_050036C8[] = {
+     gsDPSetTileSize(0, 0, 0, (32 - 1) << G_TEXTURE_IMAGE_FRAC, (32 - 1) << G_TEXTURE_IMAGE_FRAC),
+     gsSPLight(&hoot_seg5_lights_05003650.l, 1),
+     gsSPLight(&hoot_seg5_lights_05003650.a, 2),
+-    gsSPVertex(hoot_seg5_vertex_05003668, 12, 0),
++    gsSPVertex(hoot_seg5_vertex_05003668, 6, 0),
+     gsSP2Triangles( 0,  1,  2, 0x0,  3,  4,  5, 0x0),
+     gsSPEndDisplayList(),
+ };
+diff --git a/src/audio/ar_audio_hooks.h b/src/audio/ar_audio_hooks.h
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/game/ar_game_hooks.h b/src/game/ar_game_hooks.h
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/game/rendering_graph_node.c b/src/game/rendering_graph_node.c
+index 82d0da8..97925f7 100644
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -391,10 +391,10 @@ void patch_mtx_interpolated(f32 delta) {
+         Gfx *pos = interp->pos;
+         Mtx *srcMtx = interp->mtx;
+         Mtx *srcMtxPrev = interp->mtxPrev;
++        Mtx bufMtx, bufMtxPrev;   // outlive the if: srcMtx/srcMtxPrev point at them below
+ 
+         if (interp->usingCamSpace && translateCamSpace) {
+             // transform out of camera space so the matrix can interp in world space
+-            Mtx bufMtx, bufMtxPrev;
+             mtxf_copy(bufMtx.m, srcMtx->m);
+             mtxf_copy(bufMtxPrev.m, srcMtxPrev->m);
+             mtxf_mul(bufMtx.m, bufMtx.m, camTranfInv.m);
+diff --git a/src/goddard/ar_goddard.h b/src/goddard/ar_goddard.h
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/pc/configfile.c b/src/pc/configfile.c
+index 2088913..e570c40 100644
+--- a/src/pc/configfile.c
++++ b/src/pc/configfile.c
+@@ -302,7 +302,7 @@ static const struct ConfigOption options[] = {
+     {.name = "stick_deadzone",                 .type = CONFIG_TYPE_UINT, .uintValue = &configStickDeadzone},
+     {.name = "rumble_strength",                .type = CONFIG_TYPE_UINT, .uintValue = &configRumbleStrength},
+     {.name = "gamepad_number",                 .type = CONFIG_TYPE_UINT, .uintValue = &configGamepadNumber},
+-    {.name = "background_gamepad",             .type = CONFIG_TYPE_UINT, .boolValue = &configBackgroundGamepad},
++    {.name = "background_gamepad",             .type = CONFIG_TYPE_BOOL, .boolValue = &configBackgroundGamepad},
+     {.name = "extended_reports",               .type = CONFIG_TYPE_BOOL, .boolValue = &configExtendedReports},
+ #ifndef HANDHELD
+     {.name = "disable_gamepads",               .type = CONFIG_TYPE_BOOL, .boolValue = &configDisableGamepads},
+@@ -757,8 +757,8 @@ static void configfile_load_internal(const char *filename, bool* error) {
+ #endif
+                 } else {
+                     switch (option->type) {
+-                        case CONFIG_TYPE_BOOL:
+-                            if (strcmp(tokens[1], "true") == 0)
++                        case CONFIG_TYPE_BOOL:   // "1": background_gamepad was once saved as a number
++                            if (strcmp(tokens[1], "true") == 0 || strcmp(tokens[1], "1") == 0)
+                                 *option->boolValue = true;
+                             else
+                                 *option->boolValue = false;
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/pc/rom_assets.c b/src/pc/rom_assets.c
+index 0adde27..82d7f53 100644
+--- a/src/pc/rom_assets.c
++++ b/src/pc/rom_assets.c
+@@ -203,6 +203,9 @@ void rom_assets_queue(void* ptr, enum RomAssetType assetType, u32 physicalAddres
+ }
+ 
+ u8* rom_assets_decompress(u32* data, u32* decompressedSize) {
++    if (*decompressedSize < 16) {   // shorter than an MIO0 header: never compressed (and data[0] would read past the end)
++        return NULL;
++    }
+     if (BSWAP32(data[0]) != 0x4d494f30) {
+         return NULL;
+     }

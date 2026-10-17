@@ -1,0 +1,29 @@
+# Game data is Nintendo's: never commit ROMs, anything extracted from them, or packs derived from them.
+*.z64
+*.v64
+*.n64
+baserom*
+# Your ROM, packs, recordings, logs and run output live here.
+/local/
+/goldens-private/
+*.capture
+*.sarec
+*.wav
+*.mp4
+*.mov
+*.log
+.sm64ar-verified
+Bundled/
+# Build output (prepared upstream trees, fetched dependencies, Xcode projects, apps)
+/build/
+DerivedData/
+*.app/
+*.xcappdata/
+compile_commands.json
+# Editors and OS
+.DS_Store
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+.cache/

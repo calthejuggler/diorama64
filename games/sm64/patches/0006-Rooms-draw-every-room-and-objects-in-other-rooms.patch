@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Rooms: draw every room and objects in other rooms
+
+Vanilla draws only Mario's room in room-switched areas (the castle interior,
+Big Boo's Haunt, Hazy Maze Cave). On a table the whole building is visible,
+so with gArMode and gArDrawAllRooms (default on):
+
+- a room switch draws every room; its function still runs first, so the
+  room the game logic reads is unchanged;
+- gArOtherRoomObjects picks what happens to objects in other rooms: HIDDEN
+  (vanilla), FROZEN (drawn as they are; everything drawing writes to them is
+  put back) or LIVE (default: drawn and updated as if Mario were there);
+- gArHideOutside (default on) hides the area's outdoor room while Mario is
+  indoors (Big Boo's Haunt's grounds, outer walls and roof). Rendering only.
+---
+ src/game/object_helpers.c       |  6 ++-
+ src/game/rendering_graph_node.c | 94 +++++++++++++++++++++++++++++++++
+ src/pc/gfx/gfx_ar_hooks.h       |  6 +++
+ 3 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/src/game/object_helpers.c b/src/game/object_helpers.c
+index 43a556e..b8ba40c 100644
+--- a/src/game/object_helpers.c
++++ b/src/game/object_helpers.c
+@@ -32,6 +32,7 @@
+ #include "pc/lua/utils/smlua_camera_utils.h"
+ #include "pc/lua/utils/smlua_model_utils.h"
+ #include "first_person_cam.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ u8 (*gContinueDialogFunction)(void) = NULL;
+ struct Object* gContinueDialogFunctionObject = NULL;
+@@ -3131,7 +3132,10 @@ void cur_obj_enable_rendering_if_mario_in_room(void) {
+     u8 inViewOfOpenDoor = (gDoorCurrentRoom != 0)
+                        && (gDoorAdjacentRooms[gDoorCurrentRoom][0] == o->oRoom || gDoorAdjacentRooms[gDoorCurrentRoom][1] == o->oRoom);
+ 
+-    if (marioInRoom || inViewOfOpenDoor) {
++    /* AR: "Objects in other rooms: Live" (with Draw all rooms) runs them as if Mario were in their room. */
++    u8 arLive = gArMode && gArDrawAllRooms && gArOtherRoomObjects == GFX_AR_OTHER_ROOMS_LIVE;
++
++    if (marioInRoom || inViewOfOpenDoor || arLive) {
+         cur_obj_enable_rendering();
+         o->activeFlags &= ~ACTIVE_FLAG_IN_DIFFERENT_ROOM;
+         gNumRoomedObjectsInMarioRoom++;
+diff --git a/src/game/rendering_graph_node.c b/src/game/rendering_graph_node.c
+index a10e9a9..5882426 100644
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -24,6 +24,8 @@
+ #include "hardcoded.h"
+ #include "pc/gfx/gfx_ar_hooks.h"
+ #include "ar_game_hooks.h"
++#include "object_helpers.h"
++#include "level_table.h"
+ #include "level_geo.h"
+ #include "moving_texture.h"
+ 
+@@ -789,12 +791,81 @@ static void geo_process_level_of_detail(struct GraphNodeLevelOfDetail *node) {
+  * if it is 0, and among the node's children, only the selected child is
+  * processed next.
+  */
++/* AR: with gArDrawAllRooms a room switch (geo_switch_area) draws every room, not only Mario's. Rendering only: the
++ * switch's function still runs (it sets the current room the game logic reads), and objects keep their own room rules. */
++bool gArDrawAllRooms = true;
++int gArOtherRoomObjects = GFX_AR_OTHER_ROOMS_LIVE;
++bool gArHideOutside = true;
++
++/* AR "Hide outside while inside": the outdoor room of a room-switched area, 0 if it has none. BBH (area 1) is the only
++ * room-switched area with an outside: room 13 holds the grounds, the mansion's outer walls and its roof, and the doorway
++ * rooms 21, 28, 29 and 32 draw room 13's display lists too (with the room on the other side). The castle interior and HMC
++ * have no outdoor room. */
++static s16 ar_outdoor_room(void) {
++    return (gCurrLevelNum == LEVEL_BBH && gCurrAreaIndex == 1) ? 13 : 0;
++}
++static struct GraphNode *ar_switch_case(struct GraphNodeSwitchCase *node, s32 index) {
++    struct GraphNode *c = node->fnNode.node.children;
++    for (s32 i = 0; c != NULL && i < index; i++) {
++        c = c->next;
++        if (c == node->fnNode.node.children) { return NULL; }
++    }
++    return c;
++}
++static bool ar_case_draws(struct GraphNode *roomCase, const Gfx *dl) {
++    struct GraphNode *first = roomCase->children, *n = first;
++    if (first == NULL) { return false; }
++    do {
++        if (n->type == GRAPH_NODE_TYPE_DISPLAY_LIST && ((struct GraphNodeDisplayList *) n)->displayList == dl) { return true; }
++    } while ((n = n->next) != first);
++    return false;
++}
++static bool ar_case_draws_any_of(struct GraphNode *roomCase, struct GraphNode *other) {
++    struct GraphNode *first = roomCase->children, *n = first;
++    if (first == NULL) { return false; }
++    do {
++        if (n->type == GRAPH_NODE_TYPE_DISPLAY_LIST && ar_case_draws(other, ((struct GraphNodeDisplayList *) n)->displayList)) {
++            return true;
++        }
++    } while ((n = n->next) != first);
++    return false;
++}
++/* The outdoor room's case when Mario is indoors (his room, the switch's selected case, draws none of the outdoor room's
++ * display lists: not outside and not in a doorway to it); else NULL. */
++static struct GraphNode *ar_mario_indoors_outdoor_case(struct GraphNodeSwitchCase *node) {
++    const s16 outdoorRoom = ar_outdoor_room();
++    if (outdoorRoom <= 0) { return NULL; }
++    struct GraphNode *outdoor = ar_switch_case(node, outdoorRoom - 1);
++    struct GraphNode *mario = ar_switch_case(node, node->selectedCase);
++    if (outdoor == NULL || mario == NULL || ar_case_draws_any_of(mario, outdoor)) { return NULL; }
++    return outdoor;
++}
++static void ar_show_outdoor_lists(struct GraphNode *roomCase, struct GraphNode *outdoor, bool show) {
++    struct GraphNode *first = roomCase->children, *n = first;
++    if (first == NULL) { return; }
++    do {
++        if (n->type == GRAPH_NODE_TYPE_DISPLAY_LIST && ar_case_draws(outdoor, ((struct GraphNodeDisplayList *) n)->displayList)) {
++            if (show) { n->flags |= GRAPH_RENDER_ACTIVE; } else { n->flags &= ~GRAPH_RENDER_ACTIVE; }
++        }
++    } while ((n = n->next) != first);
++}
++
+ static void geo_process_switch(struct GraphNodeSwitchCase *node) {
+     struct GraphNode *selectedChild = node->fnNode.node.children;
+ 
+     if (node->fnNode.func != NULL) {
+         node->fnNode.func(GEO_CONTEXT_RENDER, &node->fnNode.node, gMatStack[gMatStackIndex]);
+     }
++    if (gArMode && gArDrawAllRooms && selectedChild != NULL && (void *) node->fnNode.func == (void *) geo_switch_area) {
++        struct GraphNode *outdoor = gArHideOutside ? ar_mario_indoors_outdoor_case(node) : NULL;
++        struct GraphNode *room = selectedChild;
++        do {
++            if (outdoor != NULL) { ar_show_outdoor_lists(room, outdoor, false); }
++            geo_process_node_and_siblings(room);   /* the parent is a switch: only this child */
++            if (outdoor != NULL) { ar_show_outdoor_lists(room, outdoor, true); }
++        } while ((room = room->next) != NULL && room != selectedChild);
++        return;
++    }
+     for (s32 i = 0; selectedChild != NULL && node->selectedCase > i; i++) {
+         selectedChild = selectedChild->next;
+     }
+@@ -1609,6 +1680,27 @@ static struct MarioBodyState *get_mario_body_state_from_mario_object(struct Obje
+ /**
+  * Process an object node.
+  */
++/* AR: "Objects in other rooms: Frozen" (with Draw all rooms): an object vanilla hides because it is in another room
++ * (ACTIVE_FLAG_IN_DIFFERENT_ROOM, so not GRAPH_RENDER_ACTIVE) is drawn as it is. Rendering only: everything drawing
++ * writes to the object (animation frame, interpolation and matrix state, geo callbacks) is put back afterwards, and its
++ * throw matrix is cleared as for a node that is not drawn. */
++static bool ar_frozen_other_room(struct GraphNode *g) {
++    if (!gArMode || !gArDrawAllRooms || gArOtherRoomObjects != GFX_AR_OTHER_ROOMS_FROZEN || g->type != GRAPH_NODE_TYPE_OBJECT) {
++        return false;
++    }
++    struct Object *o = (struct Object *) g;
++    return (o->activeFlags & ACTIVE_FLAG_ACTIVE) && (o->activeFlags & ACTIVE_FLAG_IN_DIFFERENT_ROOM) && o->oRoom != -1;
++}
++static void geo_process_object(struct Object *node);
++static void geo_process_frozen_object(struct Object *node) {
++    static struct Object saved;   /* the graph pass is single-threaded and an object's draw never draws another object */
++    saved = *node;
++    node->header.gfx.node.flags |= GRAPH_RENDER_ACTIVE;
++    geo_process_object(node);
++    *node = saved;
++    node->header.gfx.throwMatrix = NULL;
++}
++
+ static void geo_process_object(struct Object *node) {
+     struct Object* lastProcessingObject = gCurGraphNodeProcessingObject;
+     struct MarioState* lastMarioState = gCurGraphNodeMarioState;
+@@ -2129,6 +2221,8 @@ void geo_process_node_and_siblings(struct GraphNode *firstNode) {
+                 }
+             }
+             if (curGraphNode->hookProcess) smlua_call_event_hooks(HOOK_ON_GEO_PROCESS, curGraphNode, gMatStackIndex + 1);
++        } else if (ar_frozen_other_room(curGraphNode)) {
++            geo_process_frozen_object((struct Object *) curGraphNode);
+         } else {
+             if (curGraphNode && curGraphNode->type == GRAPH_NODE_TYPE_OBJECT) {
+                 ((struct GraphNodeObject *) curGraphNode)->throwMatrix = NULL;
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index 30bec45..36ff7ff 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -33,6 +33,12 @@ struct GfxArHooks {
+ };
+ extern struct GfxArHooks *gGfxArHooks;   /* NULL = upstream behaviour */
+ extern bool gArMode;
++extern bool gArDrawAllRooms;
++/* With gArMode and gArDrawAllRooms: objects in rooms other than Mario's. HIDDEN: vanilla (not drawn, not updated);
++ * FROZEN: drawn as they are, never updated (rendering only); LIVE: drawn and updated as in Mario's room (default). */
++enum { GFX_AR_OTHER_ROOMS_HIDDEN = 0, GFX_AR_OTHER_ROOMS_FROZEN = 1, GFX_AR_OTHER_ROOMS_LIVE = 2 };
++extern int gArOtherRoomObjects;
++extern bool gArHideOutside;
+ /* With gArMode: the cannon the local Mario aims from stays drawn and its barrel follows the aim (default on); off: vanilla
+  * (hidden while aiming). It changes object state (the cannon's angles), so the adapter records it with the setup. */
+ extern bool gArCannonVisible;

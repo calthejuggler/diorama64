@@ -1,0 +1,66 @@
+add_library(ar_capture STATIC capture/fc_builder.cpp)
+target_include_directories(ar_capture PUBLIC capture)
+target_include_directories(ar_capture PUBLIC include)
+
+add_library(ar_core STATIC core/ar_math.c core/ar_view.c core/ar_float_panel.c core/sarec.c core/snapshot_ring.cpp core/texture_fifo.cpp core/mem_stats.cpp core/runtime.cpp core/audio_ring.cpp core/scene_ring.cpp core/wav_io.cpp core/scene_track.cpp core/audio_settings.cpp core/audio_tuning.c)
+target_include_directories(ar_core PUBLIC include)
+target_link_libraries(ar_core PUBLIC ar_capture)
+
+add_library(ar_render_common STATIC render/common/combiner.cpp render/common/draw_list.cpp render/common/renderer.cpp
+            render/common/ar_layer.cpp render/common/debug_points.cpp render/common/scene_shapes.cpp render/common/depth_stats.cpp
+            render/common/look.cpp render/common/room_light.cpp
+            render/common/room_light_driver.cpp render/common/shadow_fit.cpp render/common/pipeline_warm.cpp)
+target_include_directories(ar_render_common PUBLIC render/common)
+target_link_libraries(ar_render_common PUBLIC ar_core)
+
+add_library(ar_render_metal STATIC render/metal/msl_emitter.cpp render/metal/metal_device.mm)
+target_include_directories(ar_render_metal PUBLIC render/metal)
+set_source_files_properties(render/metal/metal_device.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+target_link_libraries(ar_render_metal PUBLIC ar_render_common "-framework Metal" "-framework Foundation")
+
+if(NOT SM64AR_VISIONOS)
+add_library(ar_png STATIC platform/macos/png_io.mm)
+target_include_directories(ar_png PUBLIC platform/macos)
+target_compile_options(ar_png PRIVATE -fobjc-arc)
+target_link_libraries(ar_png PUBLIC "-framework Foundation" "-framework ImageIO" "-framework CoreGraphics")
+endif()
+
+add_library(ar_platform_fake STATIC platform/fake/fake_platform.c)
+target_include_directories(ar_platform_fake PUBLIC platform/fake)
+target_link_libraries(ar_platform_fake PUBLIC ar_core)
+
+set_source_files_properties(platform/apple/gc_pad.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+add_library(ar_gc_pad STATIC platform/apple/gc_pad.mm)
+target_include_directories(ar_gc_pad PUBLIC platform/apple)
+target_link_libraries(ar_gc_pad PUBLIC ar_core "-framework GameController" "-framework Foundation")
+
+add_library(ar_cube_adapter STATIC adapters/cube/cube_adapter.c)
+target_include_directories(ar_cube_adapter PUBLIC adapters/cube)
+target_link_libraries(ar_cube_adapter PUBLIC ar_core)
+
+if(NOT SM64AR_VISIONOS)
+add_library(ar_harness STATIC platform/macos/free_fly.cpp platform/macos/room.cpp
+            platform/macos/harness_platform.mm platform/macos/harness_session.mm)
+target_include_directories(ar_harness PUBLIC platform/macos)
+target_compile_options(ar_harness PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+target_link_libraries(ar_harness PUBLIC ar_render_metal ar_png ar_core ar_gc_pad "-framework Foundation")
+endif()
+
+add_library(ar_vos_logic STATIC platform/visionos/vos_log.cpp platform/visionos/vos_options.cpp platform/visionos/vos_placement.cpp
+            platform/visionos/vos_state.cpp platform/visionos/vos_resample.cpp platform/visionos/vos_perf.cpp platform/visionos/vos_color.cpp
+            platform/visionos/vos_latency.cpp platform/visionos/vos_planes.cpp platform/visionos/vos_input.cpp platform/visionos/vos_place_gesture.cpp
+            platform/visionos/vos_scene_audio.cpp platform/visionos/vos_scene_pos.cpp platform/visionos/vos_foveation.cpp
+            platform/visionos/vos_safe_mode.cpp platform/visionos/vos_polyphase.cpp)
+target_include_directories(ar_vos_logic PUBLIC platform/visionos)
+target_link_libraries(ar_vos_logic PUBLIC ar_core ar_render_common)
+
+if(SM64AR_VISIONOS)
+  set(AR_VOS_MM platform/visionos/vos_contract.mm platform/visionos/vos_placer.mm platform/visionos/vos_platform.mm
+                 platform/visionos/vos_audio.mm platform/visionos/vos_phase.mm)
+  set_source_files_properties(${AR_VOS_MM} PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+  add_library(ar_vos STATIC ${AR_VOS_MM} platform/visionos/vos_session.cpp platform/visionos/vos_pads.cpp)
+  target_include_directories(ar_vos PUBLIC platform/visionos)
+  target_link_libraries(ar_vos PUBLIC ar_vos_logic ar_render_metal ar_render_common ar_gc_pad "-framework CompositorServices"
+                        "-framework ARKit" "-framework Metal" "-framework Foundation" "-framework AudioToolbox" "-framework AVFAudio"
+                        "-framework PHASE")
+endif()

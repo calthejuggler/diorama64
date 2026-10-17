@@ -1,0 +1,1457 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] DynOS packs
+
+Makes DynOS model and texture packs safe and render-only for the AR host:
+
+- with gArDynosPacksOnly, packs load prebuilt .tex/.bin files only (no
+  PNG or source generation at boot), raw textures are checked before
+  allocation and a malformed file is refused instead of being fatal;
+- the host can approve each pack file before it loads
+  (gArDynosPackFileAllowed); size bounds refuse absurd declared lengths and
+  element counts past the end of a file;
+- gfx_pc skips or clamps display-list commands that would index past its
+  arrays or exceed its per-frame bounds, and counts them;
+- model packs are render-only: an object keeps its vanilla graph, which
+  still runs for the game state, and the pack's graph only draws, in a
+  sandbox that puts back what drawing changed. 3D pack models of billboard
+  objects can take the floor's tilt;
+- a read-only packs folder bundled with the app is scanned after the user
+  folder.
+
+With gArDynosPacksOnly == false DynOS behaves as upstream.
+---
+ data/dynos.c.h                  |   6 +
+ data/dynos.cpp.h                |  19 ++
+ data/dynos_bin_actor.cpp        |   6 +
+ data/dynos_bin_animation.cpp    |   6 +-
+ data/dynos_bin_compress.cpp     |  28 +-
+ data/dynos_bin_geo.cpp          |   5 +
+ data/dynos_bin_gfx.cpp          |   5 +
+ data/dynos_bin_pointer.cpp      |   9 +
+ data/dynos_bin_tex.cpp          |  43 ++-
+ data/dynos_bin_texlist.cpp      |   5 +
+ data/dynos_bin_vtx.cpp          |   5 +
+ data/dynos_c.cpp                |  11 +
+ data/dynos_gfx_init.cpp         |  11 +-
+ data/dynos_mgr_actor.cpp        |  19 ++
+ data/dynos_mgr_anim.cpp         |   4 +
+ data/dynos_mgr_pack.cpp         |   9 +
+ src/game/mario_misc.c           |  17 +-
+ src/game/mario_misc.h           |   4 +
+ src/game/obj_behaviors.c        |   2 +
+ src/game/rendering_graph_node.c | 567 ++++++++++++++++++++++++++------
+ src/game/rendering_graph_node.h |   6 +
+ src/pc/configfile.c             |   3 +
+ src/pc/gfx/gfx_ar_hooks.h       |  15 +
+ src/pc/gfx/gfx_pc.c             |  24 ++
+ 24 files changed, 727 insertions(+), 102 deletions(-)
+
+diff --git a/data/dynos.c.h b/data/dynos.c.h
+index 82d7a24..483875d 100644
+--- a/data/dynos.c.h
++++ b/data/dynos.c.h
+@@ -34,6 +34,9 @@ void dynos_pack_set_enabled(s32 index, bool value);
+ bool dynos_pack_get_exists(s32 index);
+ void dynos_generate_mod_pack(char* modPath);
+ void dynos_generate_packs(const char* directory);
++/* AR, Mac tools only: DynOS's own generators on an explicit folder (never at boot in AR). */
++void dynos_ar_generate_tex(const char *png_dir, const char *out_dir);
++void dynos_ar_generate_actors(const char *dir);
+ 
+ // -- geos -- //
+ void dynos_actor_override(struct Object* obj, void** aSharedChild);
+@@ -41,6 +44,9 @@ bool dynos_add_actor_custom(s32 modIndex, s32 modFileIndex, const char *filePath
+ const void* dynos_geolayout_get(const char *name);
+ bool dynos_actor_get_mod_index_and_token(struct GraphNode *graphNode, u32 tokenIndex, s32 *modIndex, s32 *modFileIndex, const char **token);
+ void dynos_actor_register_modified_graph_node(struct GraphNode *node);
++/* AR: with gArMode && gArDynosPacksOnly an object keeps its vanilla graph (dynos_actor_override does not
++ * substitute); the renderer asks for the pack graph that draws instead of it (rendering_graph_node.c). NULL: none. */
++struct GraphNode *dynos_ar_pack_graph(struct GraphNode *vanilla);
+ 
+ // -- collisions -- //
+ bool dynos_add_collision(const char *filePath, const char* collisionName);
+diff --git a/data/dynos.cpp.h b/data/dynos.cpp.h
+index 0acd633..0f1986c 100644
+--- a/data/dynos.cpp.h
++++ b/data/dynos.cpp.h
+@@ -11,7 +11,12 @@ extern "C" {
+ #include "game/moving_texture.h"
+ #include "pc/djui/djui_console.h"
+ #include "pc/fs/fmem.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ }
++/* AR: pack files are untrusted on the device; a bin larger than this, or one declaring a larger decompressed
++   length, is refused (the largest prepared actor bin is ~2 MB). */
++#define AR_DYNOS_BIN_MAX ((u64) 64 * 1024 * 1024)
++template <typename... Args> void PrintError(const char *aFmt, Args... aArgs);
+ 
+ #define FUNCTION_CODE   (u32) 0x434E5546
+ #define POINTER_CODE    (u32) 0x52544E50
+@@ -98,6 +103,13 @@ public:
+     inline s32 Offset() const { return mOffset; }
+     inline bool EoF() const { return mOffset >= mSize; }
+     inline void SetOffset(s32 aOffset) const { mOffset = aOffset; }
++    /* AR: with gArDynosPacksOnly, false when aCount elements of at least aMinBytes each cannot fit in the bytes
++       left: the caller refuses the node instead of allocating what the file asks for. */
++    inline bool ArCountFits(u64 aCount, u64 aMinBytes) const {
++        if (!gArDynosPacksOnly || aCount * aMinBytes <= (u64) (mSize > mOffset ? mSize - mOffset : 0)) { return true; }
++        gArDynosBinRefused++;
++        return false;
++    }
+     inline const char *GetFilename() const { return mFilename; }
+ 
+ public:
+@@ -320,6 +332,12 @@ public:
+             Resize(0);
+             return;
+         }
++        if (!aFile->ArCountFits((u64) _Length, sizeof(T))) {   // AR: never allocate past the file
++            PrintError("AR: refusing array of %d elements past the end of \"%s\"", _Length, aFile->GetFilename() ? aFile->GetFilename() : "?");
++            Resize(0);
++            aFile->SetOffset(aFile->Size());
++            return;
++        }
+         Resize(_Length);
+         aFile->Read<T>(mBuffer, _Length);
+     }
+@@ -910,6 +928,7 @@ ActorGfx* DynOS_Actor_GetActorGfx(const GraphNode* aGraphNode);
+ void DynOS_Actor_Valid(const void* aGeoref, ActorGfx& aActorGfx);
+ void DynOS_Actor_Invalid(const void* aGeoref, s32 aPackIndex);
+ void DynOS_Actor_Override(struct Object* obj, void** aSharedChild);
++GraphNode *DynOS_Actor_ArPackGraph(GraphNode *aVanilla);
+ void DynOS_Actor_Override_All(void);
+ void DynOS_Actor_RegisterModifiedGraphNode(GraphNode *aNode);
+ void DynOS_Actor_ModShutdown();
+diff --git a/data/dynos_bin_actor.cpp b/data/dynos_bin_actor.cpp
+index 1f2ea22..d86534e 100644
+--- a/data/dynos_bin_actor.cpp
++++ b/data/dynos_bin_actor.cpp
+@@ -91,6 +91,7 @@ GfxData *DynOS_Actor_LoadFromBinary(const SysPath &aPackFolder, const char *aAct
+ 
+     // Load data from binary file
+     GfxData *_GfxData = NULL;
++    const uint32_t _ArRefusedBefore = gArDynosBinRefused;   // AR: a size bound hit while loading refuses the actor
+     BinFile *_File = DynOS_Bin_Decompress(aFilename);
+     if (_File) {
+         PrintInfo("Loading actor '%s' from file: %s", aActorName, aFilename.c_str());
+@@ -116,6 +117,11 @@ GfxData *DynOS_Actor_LoadFromBinary(const SysPath &aPackFolder, const char *aAct
+             }
+         }
+         BinFile::Close(_File);
++        // AR: a cut-short array, or no geo layout (activation reads the last one), refuses the actor
++        if (gArDynosPacksOnly && (gArDynosBinRefused != _ArRefusedBefore || _GfxData->mGeoLayouts.Count() == 0)) {
++            PrintError("AR: refusing actor '%s' (size bound or no geo layout)", aActorName);
++            _GfxData->mErrorCount++;
++        }
+     }
+ 
+     // If something went wrong, do not register actor
+diff --git a/data/dynos_bin_animation.cpp b/data/dynos_bin_animation.cpp
+index 0d48f20..3c24765 100644
+--- a/data/dynos_bin_animation.cpp
++++ b/data/dynos_bin_animation.cpp
+@@ -1,4 +1,7 @@
+ #include "dynos.cpp.h"
++extern "C" {
++#include "pc/gfx/gfx_ar_hooks.h"
++}
+ 
+   /////////////
+  // Parsing //
+@@ -246,7 +249,8 @@ void DynOS_Anim_Table_Load(BinFile *aFile, GfxData *aGfxData) {
+             _AnimationPtr = (void *) _AnimData->mData;
+         }
+         if (!_AnimationPtr) {
+-            sys_fatal("Animation not found: %s", _AnimationName.begin());
++            if (gArDynosPacksOnly) { PrintDataError("  ERROR: animation not found: %s", _AnimationName.begin()); }
++            else { sys_fatal("Animation not found: %s", _AnimationName.begin()); }
+         }
+     }
+ 
+diff --git a/data/dynos_bin_compress.cpp b/data/dynos_bin_compress.cpp
+index 302c6c2..a2836f2 100644
+--- a/data/dynos_bin_compress.cpp
++++ b/data/dynos_bin_compress.cpp
+@@ -190,6 +190,12 @@ static BinFile *DynOS_Bin_Decompress_ModFs(const SysPath &aFilename) {
+ 
+     // Read expected uncompressed file size
+     sLengthUncompressed = ((u64 *) _Buffer)[1];
++    if (gArDynosPacksOnly && sLengthUncompressed > AR_DYNOS_BIN_MAX) {   // AR: never calloc a declared length
++        gArDynosBinRefused++;
++        PrintError("AR: refusing \"%s\": declared decompressed length %llu", aFilename.c_str(), (unsigned long long) sLengthUncompressed);
++        DynOS_Bin_Compress_Free();
++        return NULL;
++    }
+     sLengthCompressed -= _LengthHeader;
+     u8 *_BufferCompressed = sBufferCompressed + _LengthHeader;
+ 
+@@ -240,6 +246,18 @@ BinFile *DynOS_Bin_Decompress(const SysPath &aFilename) {
+         __FUNCTION__, aFilename.c_str(), "Cannot read magic"
+     )) return NULL;
+ 
++    // AR: OpenR and the compressed path read the whole file into memory; refuse an absurd size first
++    if (gArDynosPacksOnly) {
++        const bool _Seek = f_seek(sFile, 0, SEEK_END) == 0;
++        const s64 _Size = _Seek ? (s64) f_tell(sFile) : -1;
++        if (_Size < 0 || (u64) _Size > AR_DYNOS_BIN_MAX || f_seek(sFile, sizeof(u64), SEEK_SET) != 0) {
++            gArDynosBinRefused++;
++            PrintError("AR: refusing unreadable or oversized bin file \"%s\"", aFilename.c_str());
++            DynOS_Bin_Compress_Free();
++            return NULL;
++        }
++    }
++
+     // Compare with magic constant
+     // If not equal, it's not a compressed file
+     if (_Magic != DYNOS_BIN_COMPRESS_MAGIC) {
+@@ -253,6 +271,12 @@ BinFile *DynOS_Bin_Decompress(const SysPath &aFilename) {
+         f_read(&sLengthUncompressed, sizeof(u64), 1, sFile) == 1,
+         __FUNCTION__, aFilename.c_str(), "Cannot read uncompressed file size"
+     )) return NULL;
++    if (gArDynosPacksOnly && sLengthUncompressed > AR_DYNOS_BIN_MAX) {   // AR: never calloc a declared length
++        gArDynosBinRefused++;
++        PrintError("AR: refusing \"%s\": declared decompressed length %llu", aFilename.c_str(), (unsigned long long) sLengthUncompressed);
++        DynOS_Bin_Compress_Free();
++        return NULL;
++    }
+ 
+     // Retrieve file length
+     if (!DynOS_Bin_Compress_Check(
+@@ -287,7 +311,9 @@ BinFile *DynOS_Bin_Decompress(const SysPath &aFilename) {
+ 
+     // Uncompress data
+     uLongf _LengthUncompressed = (uLongf)sLengthUncompressed;
+-    int uncompressRc = uncompress(sBufferUncompressed, &_LengthUncompressed, sBufferCompressed, sLengthCompressed);
++    // AR: the compressed buffer holds the file minus its header; upstream passes the whole file length
++    const u64 _LengthIn = gArDynosPacksOnly ? sLengthCompressed - _LengthHeader : sLengthCompressed;
++    int uncompressRc = uncompress(sBufferUncompressed, &_LengthUncompressed, sBufferCompressed, _LengthIn);
+     sLengthUncompressed = _LengthUncompressed;
+     if (!DynOS_Bin_Compress_Check(
+         uncompressRc == Z_OK,
+diff --git a/data/dynos_bin_geo.cpp b/data/dynos_bin_geo.cpp
+index 465e892..aac0164 100644
+--- a/data/dynos_bin_geo.cpp
++++ b/data/dynos_bin_geo.cpp
+@@ -526,6 +526,11 @@ void DynOS_Geo_Load(BinFile *aFile, GfxData *aGfxData) {
+ 
+     // Data
+     _Node->mSize = aFile->Read<u32>();
++    if (!aFile->ArCountFits(_Node->mSize, 4)) {   // AR: a count past the end of the file
++        PrintDataError("  ERROR: AR: %u elements past the end of the file", _Node->mSize);
++        _Node->mSize = 0;
++        aFile->SetOffset(aFile->Size());
++    }
+     _Node->mData = New<GeoLayout>(_Node->mSize);
+     for (u32 i = 0; i != _Node->mSize; ++i) {
+         u32 _Value = aFile->Read<u32>();
+diff --git a/data/dynos_bin_gfx.cpp b/data/dynos_bin_gfx.cpp
+index af9c29c..9e83fa5 100644
+--- a/data/dynos_bin_gfx.cpp
++++ b/data/dynos_bin_gfx.cpp
+@@ -1159,6 +1159,11 @@ void DynOS_Gfx_Load(BinFile *aFile, GfxData *aGfxData) {
+ 
+     // Data
+     _Node->mSize = aFile->Read<u32>();
++    if (!aFile->ArCountFits(_Node->mSize, 8)) {   // AR: a count past the end of the file
++        PrintDataError("  ERROR: AR: %u elements past the end of the file", _Node->mSize);
++        _Node->mSize = 0;
++        aFile->SetOffset(aFile->Size());
++    }
+     _Node->mData = gfx_allocate_internal(NULL, _Node->mSize);
+     for (u32 i = 0; i != _Node->mSize; ++i) {
+         u32 _WordsW0 = aFile->Read<u32>();
+diff --git a/data/dynos_bin_pointer.cpp b/data/dynos_bin_pointer.cpp
+index 0612f14..ac54754 100644
+--- a/data/dynos_bin_pointer.cpp
++++ b/data/dynos_bin_pointer.cpp
+@@ -3,6 +3,9 @@ extern "C" {
+ #include "behavior_table.h"
+ #include "levels/scripts.h"
+ #include "engine/graph_node.h"
++}
++extern "C" {
++#include "pc/gfx/gfx_ar_hooks.h"
+ }
+ 
+   /////////////
+@@ -267,6 +270,7 @@ static void *GetPointerFromData(GfxData *aGfxData, const String &aPtrName, u32 a
+             if (aPtrData == 2) {
+                 return (void *) &_Node->mData->a;
+             }
++            if (gArDynosPacksOnly) { PrintDataError("  ERROR: unknown light selector %u for %s", aPtrData, aPtrName.begin()); return NULL; }
+             sys_fatal("Unknown Light type: %u", aPtrData);
+         }
+     }
+@@ -281,6 +285,7 @@ static void *GetPointerFromData(GfxData *aGfxData, const String &aPtrName, u32 a
+             if (aPtrData == 2) {
+                 return (void *) &_Node->mData->a;
+             }
++            if (gArDynosPacksOnly) { PrintDataError("  ERROR: unknown light selector %u for %s", aPtrData, aPtrName.begin()); return NULL; }
+             sys_fatal("Unknown Light type: %u", aPtrData);
+         }
+     }
+@@ -298,6 +303,7 @@ static void *GetPointerFromData(GfxData *aGfxData, const String &aPtrName, u32 a
+             if (aPtrData == 3) {
+                 return (void *) &_Node->mData->dir[0];
+             }
++            if (gArDynosPacksOnly) { PrintDataError("  ERROR: unknown light selector %u for %s", aPtrData, aPtrName.begin()); return NULL; }
+             sys_fatal("Unknown Light type: %u", aPtrData);
+         }
+     }
+@@ -312,6 +318,7 @@ static void *GetPointerFromData(GfxData *aGfxData, const String &aPtrName, u32 a
+             if (aPtrData == 2) {
+                 return (void *) &_Node->mData->colc[0];
+             }
++            if (gArDynosPacksOnly) { PrintDataError("  ERROR: unknown light selector %u for %s", aPtrData, aPtrName.begin()); return NULL; }
+             sys_fatal("Unknown Light type: %u", aPtrData);
+         }
+     }
+@@ -472,6 +479,7 @@ static void *GetPointerFromData(GfxData *aGfxData, const String &aPtrName, u32 a
+     }
+ 
+     // Error
++    if (gArDynosPacksOnly) { PrintDataError("  ERROR: pointer not found: %s", aPtrName.begin()); return NULL; }
+     sys_fatal("Pointer not found: %s", aPtrName.begin());
+     return NULL;
+ }
+@@ -502,6 +510,7 @@ void *DynOS_Pointer_Load(BinFile *aFile, GfxData *aGfxData, u32 aValue, u8 aFunc
+         if (_FunctionPtr) {
+             return _FunctionPtr;
+         }
++        if (gArDynosPacksOnly) { PrintDataError("  ERROR: invalid function index %d", _FunctionIndex); return NULL; }
+         String error = DynOS_Builtin_Func_CheckMisuse(_FunctionIndex, aFuncType);
+         if (!error.Empty()) {
+             sys_fatal(error.begin());
+diff --git a/data/dynos_bin_tex.cpp b/data/dynos_bin_tex.cpp
+index a47cd59..64e8720 100644
+--- a/data/dynos_bin_tex.cpp
++++ b/data/dynos_bin_tex.cpp
+@@ -1,9 +1,13 @@
++#include <sys/stat.h>
+ #include "dynos.cpp.h"
+ extern "C" {
+ #define STB_IMAGE_WRITE_IMPLEMENTATION
+ #include "stb/stb_image_write.h"
+ #include "pc/mods/mod_fs.h"
+ }
++extern "C" {
++#include "pc/gfx/gfx_ar_hooks.h"
++}
+ 
+ #define PNG_SIGNATURE 0x0A1A0A0D474E5089llu
+ 
+@@ -270,10 +274,17 @@ DataNode<TexData>* DynOS_Tex_Load(BinFile *aFile, GfxData *aGfxData) {
+         _Node->mData->mPngData.Read(aFile);
+         if (!_Node->mData->mPngData.Empty()) {
+             u8 *_RawData = stbi_load_from_memory(_Node->mData->mPngData.begin(), _Node->mData->mPngData.Count(), &_Node->mData->mRawWidth, &_Node->mData->mRawHeight, NULL, 4);
++            if (!_RawData && gArDynosPacksOnly) {   // AR: an undecodable embedded PNG; the loop below would read NULL
++                PrintDataError("  ERROR: cannot decode texture %s", _Node->mName.begin());
++                _Node->mData->mRawWidth = 0; _Node->mData->mRawHeight = 0;
++                _Node->mData->mRawFormat = 0; _Node->mData->mRawSize = 0;
++                _Node->mData->mRawData = Array<u8>();
++            } else {
+             _Node->mData->mRawFormat = G_IM_FMT_RGBA;
+             _Node->mData->mRawSize   = G_IM_SIZ_32b;
+             _Node->mData->mRawData   = Array<u8>(_RawData, _RawData + (_Node->mData->mRawWidth * _Node->mData->mRawHeight * 4));
+             free(_RawData);
++            }
+         } else { // Probably a palette
+             _Node->mData->mRawData   = Array<u8>();
+             _Node->mData->mRawWidth  = 0;
+@@ -314,11 +325,24 @@ DataNode<TexData>* DynOS_Tex_LoadFromBinary(const SysPath &aPackFolder, const Sy
+             free(_Buffer);
+         }
+     } else {
++        if (gArDynosPacksOnly) {   // AR: OpenR reads the whole file into memory; refuse an absurd size before that
++            struct stat _St;
++            const s64 _Max = 1024 + (s64) 4096 * 4096 * 4;
++            if (stat(aFilename.c_str(), &_St) != 0 || (s64) _St.st_size > _Max) {
++                PrintError("AR: refusing unreadable or oversized texture file \"%s\"", aFilename.c_str());
++                return NULL;
++            }
++        }
+         _File = BinFile::OpenR(aFilename.c_str());
+     }
+     if (!_File) { return NULL; }
+ 
+     u8 type = _File->Read<u8>();
++    if (gArDynosPacksOnly && type != DATA_TYPE_TEXTURE_RAW) {   // AR: the device never decodes a pack PNG
++        PrintError("AR: refusing non-raw texture file \"%s\"", aFilename.c_str());
++        BinFile::Close(_File);
++        return NULL;
++    }
+     if (type == DATA_TYPE_TEXTURE) {
+ 
+         // load png-texture
+@@ -337,7 +361,24 @@ DataNode<TexData>* DynOS_Tex_LoadFromBinary(const SysPath &aPackFolder, const Sy
+         _TexNode->mData->mRawSize = _File->Read<s32>();
+         _TexNode->mData->mRawWidth = _File->Read<s32>();
+         _TexNode->mData->mRawHeight = _File->Read<s32>();
+-        _TexNode->mData->mRawData.Read(_File);
++        if (gArDynosPacksOnly) {   // AR: check before Array::Read allocates whatever the file asks for
++            const s32 w = _TexNode->mData->mRawWidth, h = _TexNode->mData->mRawHeight;
++            const s64 left = (s64) _File->Size() - (s64) _File->Offset();
++            const s32 count = left >= 4 ? _File->Read<s32>() : -1;
++            const bool ok = _TexNode->mData->mRawFormat == G_IM_FMT_RGBA && _TexNode->mData->mRawSize == G_IM_SIZ_32b &&
++                            w >= 1 && h >= 1 && w <= 4096 && h <= 4096 && count == w * h * 4 && (s64) count == left - 4;
++            if (!ok) {
++                PrintError("AR: refusing malformed texture \"%s\" (%d x %d)", aFilename.c_str(), w, h);
++                Delete<TexData>(_TexNode->mData);
++                Delete<DataNode<TexData>>(_TexNode);
++                BinFile::Close(_File);
++                return NULL;
++            }
++            _TexNode->mData->mRawData.Resize(count);
++            _File->Read<u8>(_TexNode->mData->mRawData.begin(), count);
++        } else {
++            _TexNode->mData->mRawData.Read(_File);
++        }
+ 
+     } else if ((_File->SetOffset(0), _File->Read<u64>() == PNG_SIGNATURE)) {
+         _File->SetOffset(0);
+diff --git a/data/dynos_bin_texlist.cpp b/data/dynos_bin_texlist.cpp
+index 58cef99..4790256 100644
+--- a/data/dynos_bin_texlist.cpp
++++ b/data/dynos_bin_texlist.cpp
+@@ -73,6 +73,11 @@ DataNode<TexData*>* DynOS_TexList_Load(BinFile *aFile, GfxData *aGfxData) {
+ 
+     // Data
+     _Node->mSize = aFile->Read<u32>();
++    if (!aFile->ArCountFits(_Node->mSize, 4)) {   // AR: a count past the end of the file
++        PrintDataError("  ERROR: AR: %u elements past the end of the file", _Node->mSize);
++        _Node->mSize = 0;
++        aFile->SetOffset(aFile->Size());
++    }
+     _Node->mData = New<TexData*>(_Node->mSize);
+     for (u32 i = 0; i != _Node->mSize; ++i) {
+         u32 _Value = aFile->Read<u32>();
+diff --git a/data/dynos_bin_vtx.cpp b/data/dynos_bin_vtx.cpp
+index b266818..9ae6db1 100644
+--- a/data/dynos_bin_vtx.cpp
++++ b/data/dynos_bin_vtx.cpp
+@@ -116,6 +116,11 @@ void DynOS_Vtx_Load(BinFile *aFile, GfxData *aGfxData) {
+     // Data
+     bool isUsingF32Vtx = false;
+     _Node->mSize = aFile->Read<u32>();
++    if (!aFile->ArCountFits(_Node->mSize, 6)) {   // AR: a count past the end of the file
++        PrintDataError("  ERROR: AR: %u elements past the end of the file", _Node->mSize);
++        _Node->mSize = 0;
++        aFile->SetOffset(aFile->Size());
++    }
+     _Node->mData = vtx_allocate_internal(NULL, _Node->mSize);
+     for (u32 i = 0; i != _Node->mSize; ++i) {
+         if (isUsingF32Vtx) {
+diff --git a/data/dynos_c.cpp b/data/dynos_c.cpp
+index 28d6fc4..e627b48 100644
+--- a/data/dynos_c.cpp
++++ b/data/dynos_c.cpp
+@@ -109,8 +109,19 @@ void dynos_generate_packs(const char* directory) {
+     DynOS_Gfx_GeneratePacks(directory);
+ }
+ 
++void dynos_ar_generate_tex(const char *png_dir, const char *out_dir) {
++    SysPath _Out = out_dir;
++    DynOS_Tex_GeneratePack(png_dir, _Out, false);
++}
++
++void dynos_ar_generate_actors(const char *dir) { DynOS_Actor_GeneratePack(dir); }
++
+ // -- geos -- //
+ 
++struct GraphNode *dynos_ar_pack_graph(struct GraphNode *vanilla) {
++    return DynOS_Actor_ArPackGraph(vanilla);
++}
++
+ void dynos_actor_override(struct Object* obj, void** aSharedChild) {
+     DynOS_Actor_Override(obj, aSharedChild);
+ }
+diff --git a/data/dynos_gfx_init.cpp b/data/dynos_gfx_init.cpp
+index d098bfd..70e010b 100644
+--- a/data/dynos_gfx_init.cpp
++++ b/data/dynos_gfx_init.cpp
+@@ -2,6 +2,9 @@
+ extern "C" {
+ #include "pc/loading.h"
+ }
++extern "C" {
++#include "pc/gfx/gfx_ar_hooks.h"
++}
+ 
+ #define MOD_PATH_LEN 1024
+ 
+@@ -79,8 +82,10 @@ static void ScanPacksFolder(SysPath _DynosPacksFolder) {
+             if (fs_sys_dir_exists(_PackFolder.c_str())) {
+                 LOADING_SCREEN_MUTEX(snprintf(gCurrLoadingSegment.str, 256, "Generating DynOS Pack:\n\\#808080\\%s", _PackFolder.c_str()));
+                 DynOS_Pack_Add(_PackFolder);
+-                DynOS_Actor_GeneratePack(_PackFolder);
+-                DynOS_Tex_GeneratePack(_PackFolder, _PackFolder, false);
++                if (!gArDynosPacksOnly) {   // AR: packs are generated on the Mac; never write into a pack at boot
++                    DynOS_Actor_GeneratePack(_PackFolder);
++                    DynOS_Tex_GeneratePack(_PackFolder, _PackFolder, false);
++                }
+             }
+         }
+         closedir(_DynosPacksDir);
+@@ -95,4 +100,6 @@ void DynOS_Gfx_Init() {
+     // Scan the user path folder
+     SysPath _DynosPacksUserFolder = fstring("%s%s", DYNOS_USER_FOLDER, DYNOS_PACKS_FOLDER);
+     ScanPacksFolder(_DynosPacksUserFolder);
++
++    if (gArDynosExtraPacksFolder && *gArDynosExtraPacksFolder) { ScanPacksFolder(SysPath(gArDynosExtraPacksFolder)); }
+ }
+diff --git a/data/dynos_mgr_actor.cpp b/data/dynos_mgr_actor.cpp
+index 8e13931..60f9982 100644
+--- a/data/dynos_mgr_actor.cpp
++++ b/data/dynos_mgr_actor.cpp
+@@ -7,6 +7,9 @@ extern "C" {
+ #include "pc/lua/smlua_hooks.h"
+ #include "pc/mods/mod_fs.h"
+ }
++extern "C" {
++#include "pc/gfx/gfx_ar_hooks.h"
++}
+ 
+ static ObjectList sObjectListsToOverride[] = {
+     OBJ_LIST_PLAYER,
+@@ -195,8 +198,23 @@ void DynOS_Actor_Invalid(const void* aGeoref, s32 aPackIndex) {
+     _ValidActors.erase(aGeoref);
+ }
+ 
++// AR: a pack model is render-only. An object keeps its vanilla graph, so everything the game reads from it
++// (the graph the geo functions write state from, culling, billboard and held-object flags) stays vanilla; the renderer
++// draws the pack graph in a sandbox instead (rendering_graph_node.c, DynOS_Actor_ArPackGraph).
++static bool DynOS_Actor_ArRenderOnly() { return gArMode && gArDynosPacksOnly; }
++
++GraphNode *DynOS_Actor_ArPackGraph(GraphNode *aVanilla) {
++    if (!DynOS_Actor_ArRenderOnly() || aVanilla == NULL || aVanilla->georef == NULL) { return NULL; }
++    auto& _ValidActors = DynosValidActors();
++    if (_ValidActors.empty()) { return NULL; }
++    auto it = _ValidActors.find(aVanilla->georef);
++    if (it == _ValidActors.end() || it->second.mPackIndex == MOD_PACK_INDEX || it->second.mGraphNode == aVanilla) { return NULL; }
++    return it->second.mGraphNode;
++}
++
+ void DynOS_Actor_Override(struct Object* obj, void** aSharedChild) {
+     if ((aSharedChild == NULL) || (*aSharedChild == NULL)) { return; }
++    if (DynOS_Actor_ArRenderOnly()) { return; }
+ 
+     const void* georef = (*(GraphNode**)aSharedChild)->georef;
+     if (georef == NULL) { return; }
+@@ -225,6 +243,7 @@ void DynOS_Actor_Override(struct Object* obj, void** aSharedChild) {
+ // Used for both DynOS packs and actors from mods, only overrides existing actors
+ void DynOS_Actor_Override_All(void) {
+     if (!gObjectLists) { return; }
++    if (DynOS_Actor_ArRenderOnly()) { return; }
+ 
+     // Loop through all object lists
+     for (ObjectList list : sObjectListsToOverride) {
+diff --git a/data/dynos_mgr_anim.cpp b/data/dynos_mgr_anim.cpp
+index 58690eb..8a5dcff 100644
+--- a/data/dynos_mgr_anim.cpp
++++ b/data/dynos_mgr_anim.cpp
+@@ -9,6 +9,7 @@ extern "C" {
+ #include "pc/lua/smlua_hooks.h"
+ 
+ s8 geo_get_processing_mario_index(struct Object *obj);
++#include "pc/gfx/gfx_ar_hooks.h"
+ }
+ 
+ //
+@@ -82,6 +83,9 @@ void DynOS_Anim_Swap(void *aPtr) {
+         if (!_ActorGfx) {
+             return;
+         }
++        if (gArMode && gArDynosPacksOnly && _ActorGfx->mPackIndex != MOD_PACK_INDEX) {
++            return;   // AR: a model pack never animates an object (its animations are dropped on the Mac)
++        }
+ 
+         // GfxData
+         GfxData* _GfxData = _ActorGfx->mGfxData;
+diff --git a/data/dynos_mgr_pack.cpp b/data/dynos_mgr_pack.cpp
+index e60ccf4..b57349a 100644
+--- a/data/dynos_mgr_pack.cpp
++++ b/data/dynos_mgr_pack.cpp
+@@ -22,6 +22,15 @@ static void ScanPackBins(struct PackData* aPack) {
+         SysPath _FileName = fstring("%s/%s", aPack->mPath.c_str(), _PackEnt->d_name);
+         s32 length = strlen(_PackEnt->d_name);
+ 
++        // AR: on the device only the files the Mac staged (and the host re-hashed) load
++        const bool _PackFile = length > 4 && (!strncmp(&_PackEnt->d_name[length - 4], ".bin", 4) ||
++                                              !strncmp(&_PackEnt->d_name[length - 4], ".tex", 4));
++        if (_PackFile && gArDynosPacksOnly && gArDynosPackFileAllowed &&
++            !gArDynosPackFileAllowed(aPack->mPath.c_str(), _PackEnt->d_name)) {
++            PrintError("AR: refusing unstaged pack file \"%s\"", _FileName.c_str());
++            continue;
++        }
++
+         // check for actors
+         if (length > 4 && !strncmp(&_PackEnt->d_name[length - 4], ".bin", 4)) {
+             String _ActorName = _PackEnt->d_name;
+diff --git a/src/game/mario_misc.c b/src/game/mario_misc.c
+index 18d4275..f6ca734 100644
+--- a/src/game/mario_misc.c
++++ b/src/game/mario_misc.c
+@@ -1,4 +1,5 @@
+ #include <PR/ultratypes.h>
++#include <string.h>
+ 
+ #include "sm64.h"
+ #include "area.h"
+@@ -80,6 +81,21 @@ static s8 gMarioAttackScaleAnimation[3 * 6] = {
+ struct MarioBodyState gBodyStates[MAX_PLAYERS];
+ struct GraphNodeObject gMirrorMario[MAX_PLAYERS];  // copy of Mario's geo node for drawing mirror Mario
+ struct PlayerColor gNetworkPlayerColors[MAX_PLAYERS];
++static s16 sMarioAttackAnimCounter[MAX_PLAYERS] = { 0 };   // geo_mario_hand_foot_scaler's (file scope for AR)
++
++/* AR: the per-player state this file's geo functions keep outside gMarioStates/gBodyStates, saved and put back
++ * around a model-pack draw (rendering_graph_node.c) so a pack model never changes it. */
++_Static_assert(sizeof(s16) + sizeof(struct PlayerColor) == AR_MARIO_MISC_STATE_BYTES, "AR_MARIO_MISC_STATE_BYTES");
++void ar_mario_misc_state_save(u8 index, u8 *out) {
++    if (index >= MAX_PLAYERS) { return; }
++    memcpy(out, &sMarioAttackAnimCounter[index], sizeof(s16));
++    memcpy(out + sizeof(s16), &gNetworkPlayerColors[index], sizeof(struct PlayerColor));
++}
++void ar_mario_misc_state_restore(u8 index, const u8 *in) {
++    if (index >= MAX_PLAYERS) { return; }
++    memcpy(&sMarioAttackAnimCounter[index], in, sizeof(s16));
++    memcpy(&gNetworkPlayerColors[index], in + sizeof(s16), sizeof(struct PlayerColor));
++}
+ 
+ // This whole file is weirdly organized. It has to be the same file due
+ // to rodata boundaries and function aligns, which means the programmer
+@@ -578,7 +594,6 @@ Gfx* geo_switch_mario_hand(s32 callContext, struct GraphNode* node, UNUSED Mat4*
+  * (such as in the mirror room) results in a faster and desynced punch / kick animation.
+  */
+ Gfx* geo_mario_hand_foot_scaler(s32 callContext, struct GraphNode* node, UNUSED Mat4* mtx) {
+-    static s16 sMarioAttackAnimCounter[MAX_PLAYERS] = { 0 };
+     struct GraphNodeGenerated* asGenerated = (struct GraphNodeGenerated*) node;
+     struct GraphNodeScale* scaleNode = (struct GraphNodeScale*) node->next;
+     u8 index = geo_get_processing_object_index();
+diff --git a/src/game/mario_misc.h b/src/game/mario_misc.h
+index 02c2957..33a2f53 100644
+--- a/src/game/mario_misc.h
++++ b/src/game/mario_misc.h
+@@ -42,4 +42,8 @@ Gfx* geo_mario_cap_display_list(s32 callContext, struct GraphNode* node, UNUSED
+ Gfx *geo_process_lua_function(s32 callContext, struct GraphNode *node, UNUSED Mat4 *c);
+ Gfx *geo_switch_character_type(s32 callContext, struct GraphNode *node, UNUSED void *context);
+ 
++#define AR_MARIO_MISC_STATE_BYTES 194   /* sizeof(s16) + sizeof(struct PlayerColor), asserted in mario_misc.c */
++void ar_mario_misc_state_save(u8 index, u8 *out);
++void ar_mario_misc_state_restore(u8 index, const u8 *in);
++
+ #endif // MARIO_MISC_H
+diff --git a/src/game/obj_behaviors.c b/src/game/obj_behaviors.c
+index 2366ccf..34f889c 100644
+--- a/src/game/obj_behaviors.c
++++ b/src/game/obj_behaviors.c
+@@ -40,6 +40,7 @@
+ #include "pc/lua/utils/smlua_obj_utils.h"
+ #include "game/rng_position.h"
+ #include "rumble_init.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ /**
+  * @file obj_behaviors.c
+@@ -230,6 +231,7 @@ void obj_orient_graph(struct Object *obj, f32 normalX, f32 normalY, f32 normalZ)
+ 
+     // Passes on orienting billboard objects, i.e. coins, trees, etc.
+     if ((obj->header.gfx.node.flags & GRAPH_RENDER_BILLBOARD) && !(obj->header.gfx.sharedChild && obj->header.gfx.sharedChild->extraFlags & GRAPH_EXTRA_FORCE_3D)) {
++        if (gArMode && gArDynosPacksOnly) { ar_note_floor_orient(obj, normalX, normalY, normalZ); }   /* AR: render-only */
+         return;
+     }
+ 
+diff --git a/src/game/rendering_graph_node.c b/src/game/rendering_graph_node.c
+index 5882426..734114b 100644
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -1,4 +1,5 @@
+ #include <PR/ultratypes.h>
++#include <math.h>
+ 
+ #include "area.h"
+ #include "engine/math_util.h"
+@@ -28,6 +29,10 @@
+ #include "level_table.h"
+ #include "level_geo.h"
+ #include "moving_texture.h"
++#include "object_list_processor.h"
++#include "mario_misc.h"
++#include "pc/network/network_player.h"
++#include "data/dynos.c.h"
+ 
+ /**
+  * This file contains the code that processes the scene graph for rendering.
+@@ -282,6 +287,8 @@ static s32 ar_liquid_role(const struct GraphNodeGenerated *node) {
+     }
+     return 0;
+ }
++static s32 sArStatePass = 0;   /* AR: > 0 while a pack-drawn object's vanilla graph runs for the game state only */
++static s32 sArPackDraw = 0;    /* AR: > 0 while a model-pack graph draws inside its sandbox */
+ /* AR: player i's own geometry is tagged for the x-ray silhouette; held objects and the shadow are not. */
+ static u8 ar_focus_owner(void) {
+     if (!gArMode || sArNoFocus || gCurGraphNodeHeldObject != NULL) { return 0; }
+@@ -655,6 +662,10 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+  * render modes of layers.
+  */
+ static void geo_append_display_list(void *displayList, s16 layer) {
++    if (sArStatePass) { return; }   /* AR: the vanilla graph of a pack-drawn object draws nothing */
++    /* AR: a pack bin's GEO_ASM parameter reaches here as a layer (geo_mario_set_player_colors, mirror
++     * culling: flags >> 8); outside 0..7 it would index listHeads/listTails out of bounds. Vanilla never does. */
++    if (gArMode && gArDynosPacksOnly && (layer < 0 || layer >= GFX_NUM_MASTER_LISTS)) { gArGfxClamped++; return; }
+ 
+ #ifdef F3DEX_GBI_2
+     gSPLookAt(gDisplayListHead++, &lookAt);
+@@ -1701,7 +1712,7 @@ static void geo_process_frozen_object(struct Object *node) {
+     node->header.gfx.throwMatrix = NULL;
+ }
+ 
+-static void geo_process_object(struct Object *node) {
++static void geo_process_object_body(struct Object *node) {
+     struct Object* lastProcessingObject = gCurGraphNodeProcessingObject;
+     struct MarioState* lastMarioState = gCurGraphNodeMarioState;
+     gCurGraphNodeProcessingObject = node;
+@@ -1882,6 +1893,364 @@ static void geo_process_object(struct Object *node) {
+     gCurGraphNodeMarioState = lastMarioState;
+ }
+ 
++static s32 geo_process_held_object_body(struct GraphNodeHeldObject *node);
++
++/* ---- AR: a model-pack graph is render-only ------------------------------------------------------------
++ * Geo functions run while the graph is processed write game state (oAnimState wraps, coin angles, the held object's
++ * position, positions taken from the model's pose, Mario's punch timer, the room, ...), so a DynOS model pack, which
++ * replaces an actor's graph, would change the game. In AR an object keeps its vanilla graph (dynos_actor_override does
++ * not substitute, data/dynos_mgr_actor.cpp) and, when a pack replaces that graph, each frame:
++ *  1. state pass: the object is processed with its vanilla graph exactly where and as vanilla processes it (same
++ *     matrices, animation, switch, culling and held-object decisions, same call order), appending nothing (sArStatePass);
++ *  2. pack draw, in a sandbox: the state the state pass left (S1) is saved, the state before it (S0) is put back so the
++ *     pack graph sees what the vanilla graph saw, the pack graph draws, and S1 is restored.
++ * The sandbox holds everything the graph processors and the geo functions a pack bin may call (scripts/packs.py
++ * GEO_FUNCS, each paired with its node type) can write: the object and its prevObj, a held object and the holder's held
++ * node, the players they index (MarioState, MarioBodyState, mario_misc.c's attack counter and colours), the room globals
++ * and find_floor's flag and counters (geo_switch_area, shadows), the shadow globals and the animation globals. A held
++ * object drawn inside a pack draw with its vanilla graph also gets that graph's nodes back (their switch state is game
++ * state, e.g. Bowser's eyes). Interpolation data, the display-list pool and the shadow interpolation list are render
++ * state and are not restored. Without packs (or outside AR) nothing here runs. */
++#define AR_SB_OBJECTS 2
++#define AR_SB_PLAYERS 3
++struct ArSandbox {
++    s32 nObj;
++    struct Object *obj[AR_SB_OBJECTS];
++    struct Object objSave[AR_SB_OBJECTS];
++    struct GraphNodeHeldObject *held;
++    struct GraphNodeHeldObject heldSave;
++    s32 nPlayer;
++    u8 player[AR_SB_PLAYERS];
++    struct MarioState mario[AR_SB_PLAYERS];
++    struct MarioBodyState body[AR_SB_PLAYERS];
++    u8 misc[AR_SB_PLAYERS][AR_MARIO_MISC_STATE_BYTES];
++    s16 marioRoom, doorRoom, floorIntangible;
++    s32 floorMisses;
++    struct NumTimesCalled numCalls;
++    s8 shadowWater, shadowIce, shadowCarpet;
++    s16 shadowSurface;
++    u8 animType, animEnabled;
++    s16 animFrame, prevAnimFrame;
++    f32 animMultiplier;
++    u16 *animAttribute;
++    struct Animation *anim;
++    struct GeoAnimState geoTemp;
++    size_t nodesAt, nodesEnd;
++};
++
++/* Vanilla graph node copies: [struct GraphNode *][size_t size][bytes], 8-byte aligned, used as a stack. */
++static u8 *sArNodeSave = NULL;
++static size_t sArNodeSaveLen = 0, sArNodeSaveCap = 0;
++
++static size_t ar_graph_node_size(s16 type) {
++    switch (type) {
++        case GRAPH_NODE_TYPE_ROOT:                 return sizeof(struct GraphNodeRoot);
++        case GRAPH_NODE_TYPE_ORTHO_PROJECTION:     return sizeof(struct GraphNodeOrthoProjection);
++        case GRAPH_NODE_TYPE_PERSPECTIVE:          return sizeof(struct GraphNodePerspective);
++        case GRAPH_NODE_TYPE_MASTER_LIST:          return sizeof(struct GraphNodeMasterList);
++        case GRAPH_NODE_TYPE_START:                return sizeof(struct GraphNodeStart);
++        case GRAPH_NODE_TYPE_LEVEL_OF_DETAIL:      return sizeof(struct GraphNodeLevelOfDetail);
++        case GRAPH_NODE_TYPE_SWITCH_CASE:          return sizeof(struct GraphNodeSwitchCase);
++        case GRAPH_NODE_TYPE_CAMERA:               return sizeof(struct GraphNodeCamera);
++        case GRAPH_NODE_TYPE_TRANSLATION_ROTATION: return sizeof(struct GraphNodeTranslationRotation);
++        case GRAPH_NODE_TYPE_TRANSLATION:          return sizeof(struct GraphNodeTranslation);
++        case GRAPH_NODE_TYPE_ROTATION:             return sizeof(struct GraphNodeRotation);
++        case GRAPH_NODE_TYPE_OBJECT:               return sizeof(struct GraphNodeObject);
++        case GRAPH_NODE_TYPE_ANIMATED_PART:        return sizeof(struct GraphNodeAnimatedPart);
++        case GRAPH_NODE_TYPE_BILLBOARD:            return sizeof(struct GraphNodeBillboard);
++        case GRAPH_NODE_TYPE_DISPLAY_LIST:         return sizeof(struct GraphNodeDisplayList);
++        case GRAPH_NODE_TYPE_SCALE:                return sizeof(struct GraphNodeScale);
++        case GRAPH_NODE_TYPE_SCALE_XYZ:            return sizeof(struct GraphNodeScaleXYZ);
++        case GRAPH_NODE_TYPE_SHADOW:               return sizeof(struct GraphNodeShadow);
++        case GRAPH_NODE_TYPE_OBJECT_PARENT:        return sizeof(struct GraphNodeObjectParent);
++        case GRAPH_NODE_TYPE_GENERATED_LIST:       return sizeof(struct GraphNodeGenerated);
++        case GRAPH_NODE_TYPE_BACKGROUND:           return sizeof(struct GraphNodeBackground);
++        case GRAPH_NODE_TYPE_HELD_OBJ:             return sizeof(struct GraphNodeHeldObject);
++        case GRAPH_NODE_TYPE_CULLING_RADIUS:       return sizeof(struct GraphNodeCullingRadius);
++        case GRAPH_NODE_TYPE_BONE:                 return sizeof(struct GraphNodeBone);
++        default:                                   return 0;
++    }
++}
++
++static bool ar_nodes_save(struct GraphNode *first, s32 depth) {
++    struct GraphNode *n = first;
++    if (n == NULL) { return true; }
++    if (depth > 64) { return false; }
++    do {
++        const size_t size = ar_graph_node_size(n->type);
++        if (size == 0) { return false; }
++        const size_t need = sizeof(struct GraphNode *) + sizeof(size_t) + ((size + 7) & ~(size_t) 7);
++        if (sArNodeSaveLen + need > sArNodeSaveCap) {
++            size_t cap = sArNodeSaveCap ? sArNodeSaveCap * 2 : 16384;
++            while (cap < sArNodeSaveLen + need) { cap *= 2; }
++            u8 *p = realloc(sArNodeSave, cap);
++            if (p == NULL) { return false; }
++            sArNodeSave = p;
++            sArNodeSaveCap = cap;
++        }
++        u8 *at = sArNodeSave + sArNodeSaveLen;
++        memcpy(at, &n, sizeof n);
++        memcpy(at + sizeof n, &size, sizeof size);
++        memcpy(at + sizeof n + sizeof size, n, size);
++        sArNodeSaveLen += need;
++        if (n->children != NULL && !ar_nodes_save(n->children, depth + 1)) { return false; }
++        n = n->next;
++    } while (n != NULL && n != first);
++    return true;
++}
++
++static void ar_nodes_restore(size_t from, size_t to) {
++    for (size_t at = from; at < to;) {
++        struct GraphNode *n;
++        size_t size;
++        memcpy(&n, sArNodeSave + at, sizeof n);
++        memcpy(&size, sArNodeSave + at + sizeof n, sizeof size);
++        memcpy(n, sArNodeSave + at + sizeof n + sizeof size, size);
++        at += sizeof n + sizeof size + ((size + 7) & ~(size_t) 7);
++    }
++}
++
++static bool ar_in_object_pool(const struct Object *o) {
++    return o != NULL && o >= &gObjectPool[0] && o < &gObjectPool[OBJECT_POOL_CAPACITY];
++}
++
++static struct GraphNode *ar_pack_graph(struct Object *o) {
++    if (!gArMode || !gArDynosPacksOnly || !ar_in_object_pool(o)) { return NULL; }
++    return dynos_ar_pack_graph(o->header.gfx.sharedChild);
++}
++
++static u8 ar_player_index(struct Object *o) {
++    if (o == NULL) { return 0; }
++    struct NetworkPlayer *np = network_player_from_global_index(o->globalPlayerIndex);
++    s32 index = (np == NULL) ? 0 : np->localIndex;
++    return (index < 0 || index >= MAX_PLAYERS) ? 0 : (u8) index;
++}
++
++static void ar_sb_object(struct ArSandbox *sb, struct Object *o) {
++    if (!ar_in_object_pool(o) || sb->nObj >= AR_SB_OBJECTS) { return; }
++    for (s32 i = 0; i < sb->nObj; i++) { if (sb->obj[i] == o) { return; } }
++    sb->obj[sb->nObj++] = o;
++}
++
++static void ar_sb_player(struct ArSandbox *sb, s32 index) {
++    if (index < 0 || index >= MAX_PLAYERS || sb->nPlayer >= AR_SB_PLAYERS) { return; }
++    for (s32 i = 0; i < sb->nPlayer; i++) { if (sb->player[i] == index) { return; } }
++    sb->player[sb->nPlayer++] = (u8) index;
++}
++
++static void ar_sb_init(struct ArSandbox *sb, struct Object *obj, struct GraphNodeHeldObject *heldNode,
++                       struct Object *processing, struct MarioState *marioState) {
++    sb->nObj = 0;
++    sb->nPlayer = 0;
++    sb->held = heldNode;
++    sb->nodesAt = sb->nodesEnd = sArNodeSaveLen;
++    ar_sb_object(sb, obj);
++    if (obj != NULL) { ar_sb_object(sb, obj->prevObj); }   /* geo_update_*_from_parent, geo_move_mario_part_from_parent */
++    ar_sb_player(sb, 0);
++    ar_sb_player(sb, ar_player_index(processing));
++    if (marioState != NULL) { ar_sb_player(sb, (s32) (marioState - gMarioStates)); }
++}
++
++/* Sandboxes are about 8 KB each (two per object draw, nested up to 1 object + 4 held draws): a static pool indexed by the
++ * nesting depth keeps them off the game thread's stack (5 draws deep would be about 80 KB there). */
++#define AR_SB_POOL 12
++_Static_assert(sizeof(struct ArSandbox) <= 8192, "struct ArSandbox: 2 sandboxes per draw, AR_SB_POOL of them");
++static struct ArSandbox sArSbPool[AR_SB_POOL];
++static s32 sArSbUsed = 0;
++static struct ArSandbox *ar_sb_acquire_pair(void) {
++    if (sArSbUsed + 2 > AR_SB_POOL) { return NULL; }
++    struct ArSandbox *pair = &sArSbPool[sArSbUsed];
++    sArSbUsed += 2;
++    return pair;
++}
++static void ar_sb_release_pair(void) { sArSbUsed -= 2; }
++
++static void ar_sb_save(struct ArSandbox *sb) {
++    for (s32 i = 0; i < sb->nObj; i++) { sb->objSave[i] = *sb->obj[i]; }
++    if (sb->held != NULL) { sb->heldSave = *sb->held; }
++    for (s32 i = 0; i < sb->nPlayer; i++) {
++        sb->mario[i] = gMarioStates[sb->player[i]];
++        sb->body[i] = gBodyStates[sb->player[i]];
++        ar_mario_misc_state_save(sb->player[i], sb->misc[i]);
++    }
++    sb->marioRoom = gMarioCurrentRoom;
++    sb->doorRoom = gDoorCurrentRoom;
++    sb->floorIntangible = gFindFloorIncludeSurfaceIntangible;
++    sb->floorMisses = gNumFindFloorMisses;
++    sb->numCalls = gNumCalls;
++    sb->shadowWater = gShadowAboveWaterOrLava;
++    sb->shadowIce = gMarioOnIceOrCarpet;
++    sb->shadowCarpet = sMarioOnFlyingCarpet;
++    sb->shadowSurface = sSurfaceTypeBelowShadow;
++    sb->animType = gCurAnimType;
++    sb->animEnabled = gCurAnimEnabled;
++    sb->animFrame = gCurrAnimFrame;
++    sb->prevAnimFrame = gPrevAnimFrame;
++    sb->animMultiplier = gCurAnimTranslationMultiplier;
++    sb->animAttribute = gCurrAnimAttribute;
++    sb->anim = gCurAnim;
++    sb->geoTemp = gGeoTempState;
++}
++
++static void ar_sb_restore(const struct ArSandbox *sb) {
++    for (s32 i = 0; i < sb->nObj; i++) { *sb->obj[i] = sb->objSave[i]; }
++    if (sb->held != NULL) { *sb->held = sb->heldSave; }
++    for (s32 i = 0; i < sb->nPlayer; i++) {
++        gMarioStates[sb->player[i]] = sb->mario[i];
++        gBodyStates[sb->player[i]] = sb->body[i];
++        ar_mario_misc_state_restore(sb->player[i], sb->misc[i]);
++    }
++    gMarioCurrentRoom = sb->marioRoom;
++    gDoorCurrentRoom = sb->doorRoom;
++    gFindFloorIncludeSurfaceIntangible = sb->floorIntangible;
++    gNumFindFloorMisses = sb->floorMisses;
++    gNumCalls = sb->numCalls;
++    gShadowAboveWaterOrLava = sb->shadowWater;
++    gMarioOnIceOrCarpet = sb->shadowIce;
++    sMarioOnFlyingCarpet = sb->shadowCarpet;
++    sSurfaceTypeBelowShadow = sb->shadowSurface;
++    gCurAnimType = sb->animType;
++    gCurAnimEnabled = sb->animEnabled;
++    gCurrAnimFrame = sb->animFrame;
++    gPrevAnimFrame = sb->prevAnimFrame;
++    gCurAnimTranslationMultiplier = sb->animMultiplier;
++    gCurrAnimAttribute = sb->animAttribute;
++    gCurAnim = sb->anim;
++    gGeoTempState = sb->geoTemp;
++    ar_nodes_restore(sb->nodesAt, sb->nodesEnd);
++}
++
++static u32 sArPackDrawn = 0;
++u32 ar_pack_draws_take(void) { const u32 n = sArPackDrawn; sArPackDrawn = 0; return n; }
++
++/* AR: the floor tilt a 3D pack model of a BILLBOARD() object would get (known limit 3). obj_orient_graph returns
++ * early for a billboard object whose vanilla graph is not FORCE_3D (in AR the vanilla graph stays sharedChild), so
++ * it notes the floor normal here: render-only, indexed by pool slot, stamped with this frame (never an Object field: AR_DEEP
++ * hashes object data). The pack draw uses a note of this frame only (a coin that left the floor, or a reused slot, is
++ * never tilted by an old note), builds the matrix vanilla's obj_orient_graph would have built, and S1 puts throwMatrix back. */
++bool gArPackFloorTilt = false;
++static struct { u32 stamp; f32 n[3]; } sArOrient[OBJECT_POOL_CAPACITY];
++static u32 sArPackTilts = 0;
++void ar_note_floor_orient(struct Object *o, f32 nx, f32 ny, f32 nz) {
++    if (!ar_in_object_pool(o)) { return; }
++    const s32 i = (s32) (o - gObjectPool);
++    sArOrient[i].stamp = gGlobalTimer + 1;
++    sArOrient[i].n[0] = nx; sArOrient[i].n[1] = ny; sArOrient[i].n[2] = nz;
++}
++u32 ar_pack_tilts(void) { return sArPackTilts; }
++static struct { u32 stamp; struct Object *o; Mat4 m; } sArLastTilt;
++u32 ar_pack_tilt_last(struct Object **o, Mat4 m) {
++    *o = sArLastTilt.o;
++    mtxf_copy(m, sArLastTilt.m);
++    return sArLastTilt.stamp;
++}
++static void ar_pack_floor_tilt(struct Object *node, struct GraphNode *pack) {
++    if (!gArPackFloorTilt || node->header.gfx.throwMatrix != NULL) { return; }
++    if (!(pack->extraFlags & GRAPH_EXTRA_FORCE_3D) || !(node->header.gfx.node.flags & GRAPH_RENDER_BILLBOARD)) { return; }
++    if (!ar_in_object_pool(node)) { return; }
++    const s32 i = (s32) (node - gObjectPool);
++    if (sArOrient[i].stamp != gGlobalTimer + 1) { return; }
++    const f32 *nn = sArOrient[i].n;   /* a floor normal has ny > 0; anything else (NaN, inf, a wall) draws upright */
++    if (!isfinite(nn[0]) || !isfinite(nn[1]) || !isfinite(nn[2]) || !(nn[1] > 0.f)) { return; }
++    Mat4 *m = alloc_display_list(sizeof(*m));   /* the render pool, as vanilla's obj_orient_graph */
++    if (m == NULL) { return; }
++    Vec3f n = { nn[0], nn[1], nn[2] };
++    Vec3f pos = { node->oPosX, node->oPosY + node->oGraphYOffset, node->oPosZ };
++    mtxf_align_terrain_normal(*m, n, pos, node->oFaceAngleYaw);
++    node->header.gfx.throwMatrix = m;
++    sArPackTilts++;
++    sArLastTilt.stamp = gGlobalTimer + 1;
++    sArLastTilt.o = node;
++    mtxf_copy(sArLastTilt.m, *m);
++}
++
++static void geo_process_object(struct Object *node) {
++    struct GraphNode *pack = sArStatePass ? NULL : ar_pack_graph(node);
++    if (pack == NULL) {   /* no pack (or this is a state pass: vanilla all the way down) */
++        geo_process_object_body(node);
++        return;
++    }
++    struct ArSandbox *pair = ar_sb_acquire_pair();
++    if (pair == NULL) { geo_process_object_body(node); return; }
++    struct GraphNode *vanilla = node->header.gfx.sharedChild;
++    struct ArSandbox *s0 = &pair[0], *s1 = &pair[1];
++    ar_sb_init(s0, node, NULL, node, get_mario_state_from_object(node));
++    *s1 = *s0;
++    if (sArPackDraw == 0) {   /* inside a pack draw the outer sandbox discards everything: no state pass needed */
++        ar_sb_save(s0);
++        sArStatePass++;
++        geo_process_object_body(node);
++        sArStatePass--;
++    }
++    ar_sb_save(s1);
++    if (sArPackDraw == 0) { ar_sb_restore(s0); }
++    ar_pack_floor_tilt(node, pack);   /* AR: S1 (below) restores throwMatrix after the pack draw */
++    node->header.gfx.sharedChild = pack;
++    sArPackDraw++;
++    geo_process_object_body(node);
++    sArPackDraw--;
++    node->header.gfx.sharedChild = vanilla;
++    ar_sb_restore(s1);
++    ar_sb_release_pair();
++    sArPackDrawn++;
++}
++
++static s32 ar_held_object(struct GraphNodeHeldObject *node) {
++    static s32 sDepth = 0;   /* held draws nested inside a pack draw: a pack actor may hold Mario's held object, itself */
++    struct Object *obj = node->objNode;
++    struct GraphNode *pack = sArStatePass ? NULL : ar_pack_graph(obj);
++    if (pack == NULL && sArPackDraw == 0) { return geo_process_held_object_body(node); }
++    if (sArPackDraw > 0 && sDepth >= 4) { return TRUE; }
++    struct GraphNode *vanilla = obj->header.gfx.sharedChild;
++    struct ArSandbox *pair = ar_sb_acquire_pair();
++    if (pair == NULL) { return geo_process_held_object_body(node); }
++    struct ArSandbox *s0 = &pair[0], *s1 = &pair[1];
++    ar_sb_init(s0, obj, node, gCurGraphNodeProcessingObject, gCurGraphNodeMarioState);
++    *s1 = *s0;
++    s32 ok = TRUE;
++    if (sArPackDraw == 0) {   /* the holder draws as vanilla: run the held object's vanilla part for the state first */
++        ar_sb_save(s0);
++        sArStatePass++;
++        ok = geo_process_held_object_body(node);
++        sArStatePass--;
++    }
++    ar_sb_save(s1);
++    if (pack == NULL) {   /* inside a pack draw, an object without a pack draws its vanilla graph: keep its nodes */
++        if (!ar_nodes_save(vanilla, 0)) { sArNodeSaveLen = s1->nodesAt; ar_sb_release_pair(); return ok; }
++        s1->nodesEnd = sArNodeSaveLen;
++    }
++    if (sArPackDraw == 0) { ar_sb_restore(s0); }
++    if (pack != NULL) { obj->header.gfx.sharedChild = pack; }
++    sArPackDraw++;
++    sDepth++;
++    s32 drawn = geo_process_held_object_body(node);
++    sDepth--;
++    sArPackDraw--;
++    obj->header.gfx.sharedChild = vanilla;
++    ar_sb_restore(s1);
++    sArNodeSaveLen = s1->nodesAt;
++    ar_sb_release_pair();
++    if (pack != NULL) { sArPackDrawn++; }
++    return sArPackDraw == 0 ? ok : drawn;
++}
++/* AR: test hook. Appends to a throwaway master list with layers a hostile pack could produce; returns how
++ * many the bounds refused (all of them, in AR with packs only) and leaves the real state alone. */
++s32 ar_layer_clamp_probe(void) {
++    static const s16 layers[] = { 8, 9, 0x7F, -1, -4, 0x7FFF, -0x8000 };
++    struct GraphNodeMasterList list;
++    struct GraphNodeMasterList *saved = gCurGraphNodeMasterList;
++    const u32 before = gArGfxClamped;
++    memset(&list, 0, sizeof(list));
++    gCurGraphNodeMasterList = &list;
++    for (u32 i = 0; i < sizeof(layers) / sizeof(layers[0]); i++) { geo_append_display_list(NULL, layers[i]); }
++    gCurGraphNodeMasterList = saved;
++    for (s32 i = 0; i < GFX_NUM_MASTER_LISTS; i++) {
++        if (list.listHeads[i] != NULL || list.listTails[i] != NULL) { return -1; }
++    }
++    return (s32) (gArGfxClamped - before);
++}
++/* ---- end AR ---------------------------------------------------------------------------------------- */
++
+ /**
+  * Process an object parent node. Temporarily assigns itself as the parent of
+  * the subtree rooted at 'sharedChild' and processes the subtree, after which the
+@@ -1898,116 +2267,122 @@ static void geo_process_object_parent(struct GraphNodeObjectParent *node) {
+     }
+ }
+ 
+-/**
+- * Process a held object node.
+- */
+-void geo_process_held_object(struct GraphNodeHeldObject *node) {
++/* The held object's part of geo_process_held_object (matrix, GEO_CONTEXT_HELD_OBJ, its graph). FALSE: the matrix stack is full
++ * (the caller stops, as vanilla did). */
++static s32 geo_process_held_object_body(struct GraphNodeHeldObject *node) {
+     Mat4 mat;
+     Vec3f translation;
+     Vec3f scalePrev;
+     Vec3s anglePrev;
++    s32 hasAnimation = (node->objNode->header.gfx.node.flags & GRAPH_RENDER_HAS_ANIMATION) != 0;
++
++    translation[0] = node->translation[0] / 4.0f;
++    translation[1] = node->translation[1] / 4.0f;
++    translation[2] = node->translation[2] / 4.0f;
++
++    if (gGlobalTimer == node->objNode->header.gfx.prevScaleTimestamp + 1) {
++        vec3f_copy(scalePrev, node->objNode->header.gfx.prevScale);
++        vec3s_copy(anglePrev, node->objNode->header.gfx.prevAngle);
++    } else {
++        vec3f_copy(scalePrev, node->objNode->header.gfx.scale);
++        vec3s_copy(anglePrev, node->objNode->header.gfx.angle);
++    }
++    vec3f_copy(node->objNode->header.gfx.prevScale, node->objNode->header.gfx.scale);
++    node->objNode->header.gfx.prevScaleTimestamp = gGlobalTimer;
+ 
++    if (node->objNode->header.gfx.sharedChild->extraFlags & GRAPH_EXTRA_ROTATE_HELD) {
++        vec3s_copy(node->objNode->header.gfx.prevAngle, node->objNode->header.gfx.angle);
++        mtxf_rotate_zxy_and_translate(mat, translation, node->objNode->header.gfx.angle);
++    } else {
++        mtxf_translate(mat, translation);
++    }
++    mtxf_copy(gMatStack[gMatStackIndex + 1], *gCurGraphNodeObject->throwMatrix);
++    gMatStack[gMatStackIndex + 1][3][0] = gMatStack[gMatStackIndex][3][0];
++    gMatStack[gMatStackIndex + 1][3][1] = gMatStack[gMatStackIndex][3][1];
++    gMatStack[gMatStackIndex + 1][3][2] = gMatStack[gMatStackIndex][3][2];
++    mtxf_mul(gMatStack[gMatStackIndex + 1], mat, gMatStack[gMatStackIndex + 1]);
++    mtxf_scale_vec3f(gMatStack[gMatStackIndex + 1], gMatStack[gMatStackIndex + 1], node->objNode->header.gfx.scale);
++    if (node->objNode->header.gfx.sharedChild->extraFlags & GRAPH_EXTRA_ROTATE_HELD) {
++        mtxf_rotate_zxy_and_translate(mat, translation, anglePrev);
++    }
++    mtxf_copy(gMatStackPrev[gMatStackIndex + 1], (void *) gCurGraphNodeObject->throwMatrixPrev);
++    gMatStackPrev[gMatStackIndex + 1][3][0] = gMatStackPrev[gMatStackIndex][3][0];
++    gMatStackPrev[gMatStackIndex + 1][3][1] = gMatStackPrev[gMatStackIndex][3][1];
++    gMatStackPrev[gMatStackIndex + 1][3][2] = gMatStackPrev[gMatStackIndex][3][2];
++    mtxf_mul(gMatStackPrev[gMatStackIndex + 1], mat, gMatStackPrev[gMatStackIndex + 1]);
++    mtxf_scale_vec3f(gMatStackPrev[gMatStackIndex + 1], gMatStackPrev[gMatStackIndex + 1],
++                     scalePrev);
++
++    if (node->fnNode.func != NULL) {
++        node->fnNode.func(GEO_CONTEXT_HELD_OBJ, &node->fnNode.node, (struct DynamicPool *) gMatStack[gMatStackIndex + 1]);
++    }
++
++    s32 savedMatStackIndex = gMatStackIndex;
++    // Increment the matrix stack, If we fail to do so. Just return.
++    if (!increment_mat_stack()) { return FALSE; }
++
++    gGeoTempState.type = gCurAnimType;
++    gGeoTempState.enabled = gCurAnimEnabled;
++    gGeoTempState.frame = gCurrAnimFrame;
++    gGeoTempState.translationMultiplier = gCurAnimTranslationMultiplier;
++    gGeoTempState.attribute = gCurrAnimAttribute;
++    gGeoTempState.anim = gCurAnim;
++    gGeoTempState.prevFrame = gPrevAnimFrame;
++    gCurAnimType = 0;
++    gCurGraphNodeHeldObject = (void *) node;
++    if (node->objNode->header.gfx.animInfo.curAnim != NULL) {
++        dynos_gfx_swap_animations(node->objNode);
++        geo_set_animation_globals(&node->objNode->header.gfx.animInfo, hasAnimation);
++        if (node->objNode->hookRender) smlua_call_event_hooks(HOOK_ON_OBJECT_ANIM_UPDATE, node->objNode);
++        dynos_gfx_swap_animations(node->objNode);
++    }
++
++    // The held object is going to change the gfx state before
++    // the holder finishes rendering, so let's save the state now
++    geo_save_object_gfx_state();
++
++    geo_sanitize_object_gfx();
++    // While rendering the held object's geo tree, ensure "current object" globals
++    // refer to the held object, otherwise Lua geo callbacks can accidentally
++    // mutate the holder's render state (e.g. make Wario limbs disappear).
++    struct GraphNodeObject *savedCurGraphNodeObject = gCurGraphNodeObject;
++    gCurGraphNodeObject = &node->objNode->header.gfx;
++    geo_process_node_and_siblings(node->objNode->header.gfx.sharedChild);
++    gCurGraphNodeObject = savedCurGraphNodeObject;
++    gCurGraphNodeHeldObject = NULL;
++    gCurAnimType = gGeoTempState.type;
++    gCurAnimEnabled = gGeoTempState.enabled;
++    gCurrAnimFrame = gGeoTempState.frame;
++    gCurAnimTranslationMultiplier = gGeoTempState.translationMultiplier;
++    gCurrAnimAttribute = gGeoTempState.attribute;
++    gCurAnim = gGeoTempState.anim;
++    gPrevAnimFrame = gGeoTempState.prevFrame;
++
++    // Force-restore matrix stack index to avoid any imbalance caused by
++    // held object geo trees (including Lua geo callbacks).
++    gMatStackIndex = savedMatStackIndex;
++
++    // Restore the previously saved state before continuing
++    geo_load_object_gfx_state();
++    return TRUE;
++}
++
++/**
++ * Process a held object node.
++ */
++void geo_process_held_object(struct GraphNodeHeldObject *node) {
+     // Sanity check our stack index, If we above or equal to our stack size. Return to prevent OOB\.
+     if ((gMatStackIndex + 1) >= MATRIX_STACK_SIZE) { LOG_ERROR("Preventing attempt to exceed the maximum size %i for our matrix stack with size of %i.", MATRIX_STACK_SIZE - 1, gMatStackIndex); return; }
+ 
+ #ifdef F3DEX_GBI_2
+-    gSPLookAt(gDisplayListHead++, &lookAt);
++    if (!sArStatePass) { gSPLookAt(gDisplayListHead++, &lookAt); }
+ #endif
+ 
+     if (node->fnNode.func != NULL) {
+         node->fnNode.func(GEO_CONTEXT_RENDER, &node->fnNode.node, gMatStack[gMatStackIndex]);
+     }
+     if (node->objNode != NULL && node->objNode->header.gfx.sharedChild != NULL) {
+-        s32 hasAnimation = (node->objNode->header.gfx.node.flags & GRAPH_RENDER_HAS_ANIMATION) != 0;
+-
+-        translation[0] = node->translation[0] / 4.0f;
+-        translation[1] = node->translation[1] / 4.0f;
+-        translation[2] = node->translation[2] / 4.0f;
+-
+-        if (gGlobalTimer == node->objNode->header.gfx.prevScaleTimestamp + 1) {
+-            vec3f_copy(scalePrev, node->objNode->header.gfx.prevScale);
+-            vec3s_copy(anglePrev, node->objNode->header.gfx.prevAngle);
+-        } else {
+-            vec3f_copy(scalePrev, node->objNode->header.gfx.scale);
+-            vec3s_copy(anglePrev, node->objNode->header.gfx.angle);
+-        }
+-        vec3f_copy(node->objNode->header.gfx.prevScale, node->objNode->header.gfx.scale);
+-        node->objNode->header.gfx.prevScaleTimestamp = gGlobalTimer;
+-
+-        if (node->objNode->header.gfx.sharedChild->extraFlags & GRAPH_EXTRA_ROTATE_HELD) {
+-            vec3s_copy(node->objNode->header.gfx.prevAngle, node->objNode->header.gfx.angle);
+-            mtxf_rotate_zxy_and_translate(mat, translation, node->objNode->header.gfx.angle);
+-        } else {
+-            mtxf_translate(mat, translation);
+-        }
+-        mtxf_copy(gMatStack[gMatStackIndex + 1], *gCurGraphNodeObject->throwMatrix);
+-        gMatStack[gMatStackIndex + 1][3][0] = gMatStack[gMatStackIndex][3][0];
+-        gMatStack[gMatStackIndex + 1][3][1] = gMatStack[gMatStackIndex][3][1];
+-        gMatStack[gMatStackIndex + 1][3][2] = gMatStack[gMatStackIndex][3][2];
+-        mtxf_mul(gMatStack[gMatStackIndex + 1], mat, gMatStack[gMatStackIndex + 1]);
+-        mtxf_scale_vec3f(gMatStack[gMatStackIndex + 1], gMatStack[gMatStackIndex + 1], node->objNode->header.gfx.scale);
+-        if (node->objNode->header.gfx.sharedChild->extraFlags & GRAPH_EXTRA_ROTATE_HELD) {
+-            mtxf_rotate_zxy_and_translate(mat, translation, anglePrev);
+-        }
+-        mtxf_copy(gMatStackPrev[gMatStackIndex + 1], (void *) gCurGraphNodeObject->throwMatrixPrev);
+-        gMatStackPrev[gMatStackIndex + 1][3][0] = gMatStackPrev[gMatStackIndex][3][0];
+-        gMatStackPrev[gMatStackIndex + 1][3][1] = gMatStackPrev[gMatStackIndex][3][1];
+-        gMatStackPrev[gMatStackIndex + 1][3][2] = gMatStackPrev[gMatStackIndex][3][2];
+-        mtxf_mul(gMatStackPrev[gMatStackIndex + 1], mat, gMatStackPrev[gMatStackIndex + 1]);
+-        mtxf_scale_vec3f(gMatStackPrev[gMatStackIndex + 1], gMatStackPrev[gMatStackIndex + 1],
+-                         scalePrev);
+-
+-        if (node->fnNode.func != NULL) {
+-            node->fnNode.func(GEO_CONTEXT_HELD_OBJ, &node->fnNode.node, (struct DynamicPool *) gMatStack[gMatStackIndex + 1]);
+-        }
+-
+-        s32 savedMatStackIndex = gMatStackIndex;
+-        // Increment the matrix stack, If we fail to do so. Just return.
+-        if (!increment_mat_stack()) { return; }
+-
+-        gGeoTempState.type = gCurAnimType;
+-        gGeoTempState.enabled = gCurAnimEnabled;
+-        gGeoTempState.frame = gCurrAnimFrame;
+-        gGeoTempState.translationMultiplier = gCurAnimTranslationMultiplier;
+-        gGeoTempState.attribute = gCurrAnimAttribute;
+-        gGeoTempState.anim = gCurAnim;
+-        gGeoTempState.prevFrame = gPrevAnimFrame;
+-        gCurAnimType = 0;
+-        gCurGraphNodeHeldObject = (void *) node;
+-        if (node->objNode->header.gfx.animInfo.curAnim != NULL) {
+-            dynos_gfx_swap_animations(node->objNode);
+-            geo_set_animation_globals(&node->objNode->header.gfx.animInfo, hasAnimation);
+-            if (node->objNode->hookRender) smlua_call_event_hooks(HOOK_ON_OBJECT_ANIM_UPDATE, node->objNode);
+-            dynos_gfx_swap_animations(node->objNode);
+-        }
+-
+-        // The held object is going to change the gfx state before
+-        // the holder finishes rendering, so let's save the state now
+-        geo_save_object_gfx_state();
+-
+-        geo_sanitize_object_gfx();
+-        // While rendering the held object's geo tree, ensure "current object" globals
+-        // refer to the held object, otherwise Lua geo callbacks can accidentally
+-        // mutate the holder's render state (e.g. make Wario limbs disappear).
+-        struct GraphNodeObject *savedCurGraphNodeObject = gCurGraphNodeObject;
+-        gCurGraphNodeObject = &node->objNode->header.gfx;
+-        geo_process_node_and_siblings(node->objNode->header.gfx.sharedChild);
+-        gCurGraphNodeObject = savedCurGraphNodeObject;
+-        gCurGraphNodeHeldObject = NULL;
+-        gCurAnimType = gGeoTempState.type;
+-        gCurAnimEnabled = gGeoTempState.enabled;
+-        gCurrAnimFrame = gGeoTempState.frame;
+-        gCurAnimTranslationMultiplier = gGeoTempState.translationMultiplier;
+-        gCurrAnimAttribute = gGeoTempState.attribute;
+-        gCurAnim = gGeoTempState.anim;
+-        gPrevAnimFrame = gGeoTempState.prevFrame;
+-
+-        // Force-restore matrix stack index to avoid any imbalance caused by
+-        // held object geo trees (including Lua geo callbacks).
+-        gMatStackIndex = savedMatStackIndex;
+-
+-        // Restore the previously saved state before continuing
+-        geo_load_object_gfx_state();
++        if (!ar_held_object(node)) { return; }
+     }
+ 
+     if (node->fnNode.node.children != NULL) {
+diff --git a/src/game/rendering_graph_node.h b/src/game/rendering_graph_node.h
+index f30ea4a..c4a4a73 100644
+--- a/src/game/rendering_graph_node.h
++++ b/src/game/rendering_graph_node.h
+@@ -65,4 +65,10 @@ struct ShadowInterp {
+     struct GraphNodeObject *obj;
+ };
+ 
++u32 ar_pack_draws_take(void);
++void ar_note_floor_orient(struct Object *o, f32 nx, f32 ny, f32 nz);   /* AR: obj_orient_graph's dropped normal */
++u32 ar_pack_tilts(void);
++u32 ar_pack_tilt_last(struct Object **o, Mat4 m);
++s32 ar_layer_clamp_probe(void);   /* test hook: layers a hostile pack could produce are refused (-1: one got in) */
++
+ #endif // RENDERING_GRAPH_NODE_H
+diff --git a/src/pc/configfile.c b/src/pc/configfile.c
+index e570c40..8d35aec 100644
+--- a/src/pc/configfile.c
++++ b/src/pc/configfile.c
+@@ -22,6 +22,7 @@
+ #include "game/save_file.h"
+ #include "pc/network/network_player.h"
+ #include "pc/pc_main.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ #define ARRAY_LEN(arr) (sizeof(arr) / sizeof(arr[0]))
+ 
+@@ -532,6 +533,7 @@ void enable_queued_dynos_packs(void) {
+ }
+ 
+ static void dynos_pack_read(char** tokens, int numTokens) {
++    if (gArDynosPacksOnly) { return; }   // AR: the host chooses packs each run; never enable one from the config
+     if (numTokens < 2) { return; }
+     if (strcmp(tokens[numTokens-1], "false") == 0) { return; } // Only accept enabled packs. Default is disabled. (old coop config compatibility)
+     char fullPackName[256] = { 0 };
+@@ -554,6 +556,7 @@ static void dynos_pack_read(char** tokens, int numTokens) {
+ }
+ 
+ static void dynos_pack_write(FILE* file) {
++    if (gArDynosPacksOnly) { return; }   // AR: never persist the enabled packs
+     int packCount = dynos_pack_get_count();
+     for (int i = 0; i < packCount; i++) {
+         if (dynos_pack_get_enabled(i)) {
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index 36ff7ff..2a50957 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -33,12 +33,27 @@ struct GfxArHooks {
+ };
+ extern struct GfxArHooks *gGfxArHooks;   /* NULL = upstream behaviour */
+ extern bool gArMode;
++extern bool gArDynosPacksOnly;   /* DynOS packs load prebuilt .tex/.bin only (no PNG/source generation at boot), raw
++                                    textures are checked before allocation, and a malformed pack file is refused instead of
++                                    fatal. Default false (upstream); sm64_host_boot sets it. */
++/* with gArDynosPacksOnly: display-list commands gfx_pc skipped or clamped because they would index past its arrays
++   (vertex loads, triangles, light counts and copies) or exceed its per-frame command and nesting bounds. Cumulative. */
++extern uint32_t gArGfxClamped;
++/* final, with gArDynosPacksOnly: the host's check of each pack .bin/.tex before DynOS loads it (NULL: every file loads).
++   packDir is the pack folder, file the entry name; false refuses the file. The host allows only the files its staging stamp
++   lists with a matching sha256. */
++extern bool (*gArDynosPackFileAllowed)(const char *packDir, const char *file);
++/* final, with gArDynosPacksOnly: pack files the loader refused or cut short by a size bound (an absurd declared
++   decompressed length or file size, an element count past the end of the file). Cumulative. */
++extern uint32_t gArDynosBinRefused;
++extern const char *gArDynosExtraPacksFolder;
+ extern bool gArDrawAllRooms;
+ /* With gArMode and gArDrawAllRooms: objects in rooms other than Mario's. HIDDEN: vanilla (not drawn, not updated);
+  * FROZEN: drawn as they are, never updated (rendering only); LIVE: drawn and updated as in Mario's room (default). */
+ enum { GFX_AR_OTHER_ROOMS_HIDDEN = 0, GFX_AR_OTHER_ROOMS_FROZEN = 1, GFX_AR_OTHER_ROOMS_LIVE = 2 };
+ extern int gArOtherRoomObjects;
+ extern bool gArHideOutside;
++extern bool gArPackFloorTilt;
+ /* With gArMode: the cannon the local Mario aims from stays drawn and its barrel follows the aim (default on); off: vanilla
+  * (hidden while aiming). It changes object state (the cannon's angles), so the adapter records it with the setup. */
+ extern bool gArCannonVisible;
+diff --git a/src/pc/gfx/gfx_pc.c b/src/pc/gfx/gfx_pc.c
+index 6b6f514..1e2ee6e 100644
+--- a/src/pc/gfx/gfx_pc.c
++++ b/src/pc/gfx/gfx_pc.c
+@@ -125,6 +125,17 @@ static f32 sDepthZMult = 1;
+ static f32 sDepthZSub = 0;
+ struct GfxArHooks *gGfxArHooks = NULL;
+ bool gArMode = false;
++bool gArDynosPacksOnly = false;
++/* gArDynosPacksOnly: pack display lists are validated on the Mac (scripts/packs.py); these bounds are the device's
++   second line. Commands one frame may execute and the G_DL push nesting; far above anything vanilla or a pack draws. */
++#define GFX_AR_DL_MAX_COMMANDS (1u << 22)
++#define GFX_AR_DL_MAX_DEPTH 64
++static uint32_t sArDlCommands;
++static int sArDlDepth;
++uint32_t gArGfxClamped = 0;
++bool (*gArDynosPackFileAllowed)(const char *packDir, const char *file) = NULL;
++uint32_t gArDynosBinRefused = 0;
++const char *gArDynosExtraPacksFolder = NULL;
+ static int sArSpace = GFX_AR_SPACE_SCREEN;
+ static int sArCull = -1;
+ static inline bool gfx_ar_world(void) { return gGfxArHooks != NULL && sArSpace == GFX_AR_SPACE_WORLD; }
+@@ -797,6 +808,7 @@ static OPTIMIZE_O3 void gfx_local_to_world_space(VEC_OUT Vec3f pos, VEC_OUT Vec3
+ 
+ static void OPTIMIZE_O3 gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices, bool luaVertexColor) {
+     if (!vertices) { return; }
++    if (gArDynosPacksOnly && (n_vertices > MAX_VERTICES || dest_index > MAX_VERTICES - n_vertices)) { gArGfxClamped++; return; }
+ 
+     Vec3f globalLightCached[2];
+     Vec3f vertexColorCached;
+@@ -1121,6 +1133,7 @@ static void gfx_ar_report_material(void) {
+ }
+ 
+ static void OPTIMIZE_O3 gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
++    if (gArDynosPacksOnly && (vtx1_idx >= MAX_VERTICES + 4 || vtx2_idx >= MAX_VERTICES + 4 || vtx3_idx >= MAX_VERTICES + 4)) { gArGfxClamped++; return; }
+     struct GfxVertex *v1 = &rsp.loaded_vertices[vtx1_idx];
+     struct GfxVertex *v2 = &rsp.loaded_vertices[vtx2_idx];
+     struct GfxVertex *v3 = &rsp.loaded_vertices[vtx3_idx];
+@@ -1465,6 +1478,7 @@ static void gfx_sp_copymem(uint8_t idx, uint16_t dstofs, uint16_t srcofs, UNUSED
+     if (idx == G_MV_LIGHT) {
+         const int srcidx = srcofs / 24 - 2;
+         const int dstidx = dstofs / 24 - 2;
++        if (gArDynosPacksOnly && (srcidx < 0 || dstidx < 0)) { gArGfxClamped++; return; }
+         if (srcidx <= MAX_LIGHTS && dstidx <= MAX_LIGHTS) {
+             memcpy(rsp.current_lights + dstidx, rsp.current_lights + srcidx, sizeof(Light_t));
+         }
+@@ -1477,6 +1491,7 @@ static void gfx_sp_moveword(uint8_t index, uint16_t offset, uint32_t data) {
+         case G_MW_NUMLIGHT:
+ #ifdef F3DEX_GBI_2
+             rsp.current_num_lights = data / 24 + 1; // add ambient light
++            if (gArDynosPacksOnly && data / 24 + 1 > MAX_LIGHTS + 1) { rsp.current_num_lights = MAX_LIGHTS + 1; gArGfxClamped++; }
+ #else
+             // Ambient light is included
+             // The 31th bit is a flag that lights should be recalculated
+@@ -1896,6 +1911,10 @@ static void OPTIMIZE_O3 gfx_run_dl(Gfx* cmd) {
+     if (!cmd) { return; }
+ 
+     for (;;) {
++        if (gArDynosPacksOnly && ++sArDlCommands > GFX_AR_DL_MAX_COMMANDS) {
++            if (sArDlCommands == GFX_AR_DL_MAX_COMMANDS + 1) { gArGfxClamped++; }
++            return;
++        }
+         uint32_t opcode = cmd->words.w0 >> 24;
+ 
+         switch (opcode) {
+@@ -1955,7 +1974,10 @@ static void OPTIMIZE_O3 gfx_run_dl(Gfx* cmd) {
+             case G_DL:
+                 if (C0(16, 1) == 0) {
+                     // Push return address
++                    if (gArDynosPacksOnly && sArDlDepth >= GFX_AR_DL_MAX_DEPTH) { gArGfxClamped++; break; }
++                    sArDlDepth++;
+                     gfx_run_dl((Gfx *)seg_addr(cmd->words.w1));
++                    sArDlDepth--;
+                 } else {
+                     cmd = (Gfx *)seg_addr(cmd->words.w1);
+                     --cmd; // increase after break
+@@ -2214,6 +2236,8 @@ void gfx_run(Gfx *commands) {
+ 
+     //double t0 = gfx_wapi->get_time();
+     gfx_rapi->start_frame();
++    sArDlCommands = 0;
++    sArDlDepth = 0;
+     gfx_run_dl(commands);
+ }
+ 

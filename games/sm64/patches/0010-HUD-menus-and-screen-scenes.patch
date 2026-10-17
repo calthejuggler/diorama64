@@ -1,0 +1,341 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] HUD, menus and screen scenes
+
+2D parts of the game that the AR view shows as panels over the table:
+
+- with a host hook, render_hud draws the host's HUD instead of the vanilla
+  HUD body; text labels get their own overlay group, the screen-space cannon
+  circle is not drawn, and the power meter stays at a fixed position;
+- in story mode the file select, act selector and cake screen are a "screen
+  scene": their real camera, vanilla culling and SCREEN tags, all inside
+  overlay group MENU (gfx_ar_menu_scene). Everything else keeps the AR
+  world rules;
+- the race timer and the credits text are overlay groups of their own;
+- while the host sets gArPipSky, a level's background node draws vanilla's
+  skybox or fill colour again inside overlay group PIP, as the background
+  of the intro's picture-in-picture.
+---
+ src/engine/level_script.c       |  8 ++++++++
+ src/game/ar_game_hooks.h        |  2 ++
+ src/game/area.c                 |  8 ++++++++
+ src/game/geo_misc.c             |  2 ++
+ src/game/hud.c                  | 14 +++++++++++--
+ src/game/rendering_graph_node.c | 35 ++++++++++++++++++++++-----------
+ src/game/screen_transition.c    |  2 ++
+ src/pc/gfx/gfx_ar_hooks.h       | 15 +++++++++++++-
+ 8 files changed, 72 insertions(+), 14 deletions(-)
+
+diff --git a/src/engine/level_script.c b/src/engine/level_script.c
+index 5735526..340b092 100644
+--- a/src/engine/level_script.c
++++ b/src/engine/level_script.c
+@@ -480,10 +480,18 @@ static void level_cmd_load_model_from_dl(void) {
+     sCurrentCmd = CMD_NEXT;
+ }
+ 
++static bool sArPermCommon = false;   /* AR: the common models (from Mario's on) went into the permanent pool */
+ static void level_cmd_load_model_from_geo(void) {
+     s16 arg0 = CMD_GET(s16, 2);
+     void *arg1 = CMD_GET(void *, 4);
+ 
++    /* AR: in story the splash, title and file select run before level_main_scripts_entry, and their FREE_LEVEL_POOL
++     * already ended the permanent loads, so the common models (Mario, coins, stars; Mario's comes first) would go into the
++     * level pool and the grounds' ALLOC_LEVEL_POOL would drop them (Mario and the act selector's stars drawn without a
++     * model). Re-open the permanent loads for that first common block, until its own FREE_LEVEL_POOL. */
++    if (gArMode && gArStory && arg0 == MODEL_MARIO && sFinishedLoadingPerm && !sArPermCommon) { sFinishedLoadingPerm = false; }
++    if (gArMode && arg0 == MODEL_MARIO && !sFinishedLoadingPerm) { sArPermCommon = true; }
++
+     u32 id = arg0;
+     dynos_model_load_geo(&id, sFinishedLoadingPerm ? MODEL_POOL_LEVEL : MODEL_POOL_PERMANENT, arg1, true);
+ 
+diff --git a/src/game/ar_game_hooks.h b/src/game/ar_game_hooks.h
+index d835272..570e8ca 100644
+--- a/src/game/ar_game_hooks.h
++++ b/src/game/ar_game_hooks.h
+@@ -14,6 +14,8 @@ struct ArGameHooks {
+      * levelPos is gMatStack[gMatStackIndex][3], which is level space only because ar_camera_lookat
+      * (rendering_graph_node.c) makes the view the identity in AR mode; if that changes, pass a level-space point. */
+     void (*listener_vector)(f32 out[3], f32 levelPos[3]);
++    /* The AR-first HUD, drawn instead of the vanilla HUD body once the ortho matrix is set. */
++    void (*render_hud)(void);
+     /* Called by initiate_warp; 1 = the host handled this warp and nothing else happens. */
+     s32 (*before_warp)(s16 destLevel, s16 destArea, s16 destWarpNode, s32 arg);
+     /* Called where a game over would send Mario to the entry level (initiate_delayed_warp, WARP_OP_GAME_OVER). 1 = the
+diff --git a/src/game/area.c b/src/game/area.c
+index 1f94712..616331a 100644
+--- a/src/game/area.c
++++ b/src/game/area.c
+@@ -450,7 +450,10 @@ void play_transition_after_delay(s16 transType, s16 time, u8 red, u8 green, u8 b
+ void render_game(void) {
+     dynos_update_gfx();
+     if (gCurrentArea != NULL && !gWarpTransition.pauseRendering) {
++        const bool arMenu = gfx_ar_menu_scene();   /* AR: the whole menu screen is one panel */
++        if (arMenu) { GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_MENU); }
+         geo_process_root(gCurrentArea->root, gViewportOverride, gViewportClip, gFBSetColor);
++        if (arMenu) { GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_MENU); }
+         GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_MISC);
+ 
+         gSPViewport(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(&gViewportFullscreen));
+@@ -471,10 +474,15 @@ void render_game(void) {
+         render_hud();
+ 
+         gDPSetScissor(gDisplayListHead++, G_SC_NON_INTERLACE, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_LABELS);
+         render_text_labels();
++        GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_LABELS);
+         do_cutscene_handler();
+         if (!gDjuiInMainMenu) {
++            const bool arCredits = gArMode && gArStory;   /* AR: the credits text is its own panel */
++            if (arCredits) { GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_CREDITS); }
+             print_displaying_credits_entry();
++            if (arCredits) { GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_CREDITS); }
+         }
+         gDPSetScissor(gDisplayListHead++, G_SC_NON_INTERLACE, 0, BORDER_HEIGHT, SCREEN_WIDTH,
+                       SCREEN_HEIGHT - BORDER_HEIGHT);
+diff --git a/src/game/geo_misc.c b/src/game/geo_misc.c
+index 1af3e55..84b15b1 100644
+--- a/src/game/geo_misc.c
++++ b/src/game/geo_misc.c
+@@ -17,6 +17,7 @@
+ #include "save_file.h"
+ #include "segment2.h"
+ #include "hardcoded.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ /**
+  * @file geo_misc.c
+@@ -196,6 +197,7 @@ Gfx *geo_exec_cake_end_screen(s32 callContext, struct GraphNode *node, UNUSED f3
+     Gfx *displayListHead = NULL;
+ 
+     if (callContext == GEO_CONTEXT_RENDER) {
++        if (gArMode && gArStory) { gArScreen = GFX_AR_SCREEN_CAKE; }   /* AR: the cake is a menu screen from the next frame */
+         displayList = alloc_display_list(3 * sizeof(*displayList));
+         if (displayList == NULL) { return NULL; }
+         displayListHead = displayList;
+diff --git a/src/game/hud.c b/src/game/hud.c
+index 95fb4cd..18b5146 100644
+--- a/src/game/hud.c
++++ b/src/game/hud.c
+@@ -25,6 +25,7 @@
+ #include "pc/lua/utils/smlua_obj_utils.h"
+ #include "data/dynos_mgr_builtin_externs.h"
+ #include "pc/gfx/gfx_ar_hooks.h"
++#include "ar_game_hooks.h"
+ 
+ extern bool gDjuiInMainMenu;
+ u8 gOverrideHideHud;
+@@ -72,6 +73,11 @@ UNUSED static struct UnusedHUDStruct sUnusedHUDValues = { 0x00, 0x0A, 0x00 };
+ 
+ static struct CameraHUD sCameraHUD = { CAM_STATUS_NONE };
+ 
++/* AR draws the meter whenever its own rule says (ar_hud.c), always at the visible position: vanilla's slide position is
++ * off-screen while its own state machine hides the meter, and the overlay group is cropped to its draws. */
++#define AR_POWER_METER_X 140.f
++#define AR_POWER_METER_Y 200.f
++
+ static u32 sPowerMeterPrevTimestamp;
+ static f32 sPowerMeterPrevY;
+ static Gfx *sPowerMeterDisplayListPos = NULL;
+@@ -90,7 +96,7 @@ void patch_hud_interpolated(f32 delta) {
+     if (sPowerMeterDisplayListPos && sPowerMeterMtx) {
+         Mtx* mtx = sPowerMeterMtx;
+         f32 interpY = delta_interpolate_f32(sPowerMeterPrevY, (f32)sPowerMeterHUD.y, delta);
+-        guTranslate(mtx, (f32) sPowerMeterHUD.x, interpY, 0);
++        guTranslate(mtx, gArMode ? AR_POWER_METER_X : (f32) sPowerMeterHUD.x, gArMode ? AR_POWER_METER_Y : interpY, 0);
+         gSPMatrix(sPowerMeterDisplayListPos, VIRTUAL_TO_PHYSICAL(mtx),
+               G_MTX_MODELVIEW | G_MTX_MUL | G_MTX_PUSH);
+     }
+@@ -155,7 +161,7 @@ void render_dl_power_meter(s16 numHealthWedges) {
+         return;
+     }
+ 
+-    guTranslate(mtx, (f32) sPowerMeterHUD.x, sPowerMeterPrevY, 0);
++    guTranslate(mtx, gArMode ? AR_POWER_METER_X : (f32) sPowerMeterHUD.x, gArMode ? AR_POWER_METER_Y : sPowerMeterPrevY, 0);
+     sPowerMeterMtx = mtx;
+     sPowerMeterDisplayListPos = gDisplayListHead;
+ 
+@@ -623,6 +629,10 @@ void render_hud(void) {
+ #else
+         create_dl_ortho_matrix();
+ #endif
++        if (AR_GAME_HOOK(render_hud)) {   /* AR: no permanent HUD; the host draws the meter, pop-ups and pause counters */
++            gArGameHooks->render_hud();
++            return;
++        }
+         GFX_AR_EMIT_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_COUNTERS);
+ 
+         bool showHud = (!gDjuiInMainMenu && !gOverrideHideHud);
+diff --git a/src/game/rendering_graph_node.c b/src/game/rendering_graph_node.c
+index 4670097..a9f99ed 100644
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -332,12 +332,12 @@ static void reset_mtx(void) {
+ /* AR: the viewer is not Lakitu. World geometry is emitted in level space (identity view) while the
+  * camera node still runs, so cutscenes and camera-driven game logic behave as in the original. */
+ static void ar_camera_lookat(Mat4 m, Vec3f pos, Vec3f focus, s16 roll) {
+-    if (gArMode) { mtxf_identity(m); } else { mtxf_lookat(m, pos, focus, roll); }
++    if (gArMode && !gfx_ar_menu_scene()) { mtxf_identity(m); } else { mtxf_lookat(m, pos, focus, roll); }
+ }
+ 
+ /* AR: billboards face the viewer's head, not the hidden Lakitu's screen plane. */
+ static void ar_billboard(Mat4 dest, Mat4 mtx, Vec3f pos, s16 roll, s32 cylinder) {
+-    if (AR_GAME_HOOK(billboard)) {
++    if (AR_GAME_HOOK(billboard) && !gfx_ar_menu_scene()) {
+         gArGameHooks->billboard(dest, mtx, pos, cylinder);
+     } else if (cylinder) {
+         mtxf_cylboard(dest, mtx, pos, roll);
+@@ -373,7 +373,7 @@ void patch_mtx_before(void) {
+ /* Far plane raised to the maximum and no depth cull: the user's "infinite" setting, or AR (the whole diorama is always
+  * in view). The saved configDrawDistance itself is never changed. */
+ bool draw_distance_far_plane_unbounded(void) {
+-    return gArMode || configDrawDistance == 6;
++    return (gArMode && !gfx_ar_menu_scene()) || configDrawDistance == 6;
+ }
+ 
+ void patch_mtx_interpolated(f32 delta) {
+@@ -619,7 +619,7 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+             gDPSetRenderMode(gDisplayListHead++, modeList->modes[i], mode2List->modes[i]);
+             while (currList != NULL) {
+                 if (gArMode) {
+-                    s32 want = currList->usingCamSpace ? GFX_AR_SPACE_WORLD : GFX_AR_SPACE_SCREEN;
++                    s32 want = (currList->usingCamSpace && !gfx_ar_menu_scene()) ? GFX_AR_SPACE_WORLD : GFX_AR_SPACE_SCREEN;
+                     if (want != arSpace) {
+                         gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_SPACE, want));
+                         arSpace = want;
+@@ -922,7 +922,7 @@ static void geo_process_camera(struct GraphNodeCamera *node) {
+     if (node->fnNode.func != NULL) {
+         node->fnNode.func(GEO_CONTEXT_RENDER, &node->fnNode.node, gMatStack[gMatStackIndex]);
+     }
+-    mtxf_rotate_xy(rollMtx->m, gArMode ? 0 : node->rollScreen);
++    mtxf_rotate_xy(rollMtx->m, (gArMode && !gfx_ar_menu_scene()) ? 0 : node->rollScreen);
+ 
+     gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(rollMtx), G_MTX_PROJECTION | G_MTX_MUL | G_MTX_NOPUSH);
+ 
+@@ -1257,13 +1257,15 @@ static void geo_process_generated_list(struct GraphNodeGenerated *node) {
+  * the function of the node. If that function is null or returns null, a black
+  * rectangle is drawn instead.
+  */
++bool gArPipSky = false;
+ static void geo_process_background(struct GraphNodeBackground *node) {
+     Gfx *list = NULL;
+ 
+-    if (gArMode) {   /* AR: no skybox and no background fill; the room is the background */
++    if (gArMode && !gArPipSky) {   /* AR: no skybox and no background fill; the room is the background */
+         if (node->fnNode.node.children != NULL) { geo_process_node_and_siblings(node->fnNode.node.children); }
+         return;
+     }
++    const bool arPip = gArMode;
+ 
+     if (node->fnNode.func != NULL) {
+         Vec3f posCopy;
+@@ -1282,16 +1284,26 @@ static void geo_process_background(struct GraphNodeBackground *node) {
+         vec3f_copy(gLakituState.focus, focusCopy);
+     }
+ 
+-    if (list != NULL) {
++    if (list != NULL && arPip) {
++        Gfx *w = alloc_display_list(sizeof(Gfx) * 4);
++        if (w != NULL) {
++            gDPNoOpTag(&w[0], GFX_AR_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_PIP));
++            gSPDisplayList(&w[1], list);
++            gDPNoOpTag(&w[2], GFX_AR_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_PIP));
++            gSPEndDisplayList(&w[3]);
++            geo_append_display_list((void *) VIRTUAL_TO_PHYSICAL(w), node->fnNode.node.flags >> 8);
++        }
++    } else if (list != NULL) {
+         geo_append_display_list((void *) VIRTUAL_TO_PHYSICAL(list), node->fnNode.node.flags >> 8);
+     } else if (gCurGraphNodeMasterList != NULL) {
+ #ifndef F3DEX_GBI_2E
+-        Gfx *gfxStart = alloc_display_list(sizeof(Gfx) * 7);
++        Gfx *gfxStart = alloc_display_list(sizeof(Gfx) * (arPip ? 9 : 7));
+ #else
+-        Gfx *gfxStart = alloc_display_list(sizeof(Gfx) * 8);
++        Gfx *gfxStart = alloc_display_list(sizeof(Gfx) * (arPip ? 10 : 8));
+ #endif
+         Gfx *gfx = gfxStart;
+         if (gfx == NULL) { return; }
++        if (arPip) { gDPNoOpTag(gfx++, GFX_AR_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_PIP)); }
+ 
+         gDPPipeSync(gfx++);
+         gDPSetCycleType(gfx++, G_CYC_FILL);
+@@ -1300,6 +1312,7 @@ static void geo_process_background(struct GraphNodeBackground *node) {
+         GFX_DIMENSIONS_RECT_FROM_RIGHT_EDGE(0) - 1, SCREEN_HEIGHT - BORDER_HEIGHT - 1);
+         gDPPipeSync(gfx++);
+         gDPSetCycleType(gfx++, G_CYC_1CYCLE);
++        if (arPip) { gDPNoOpTag(gfx++, GFX_AR_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_PIP)); }
+         gSPEndDisplayList(gfx++);
+         gReadOnlyBackground = -1;
+ 
+@@ -1640,7 +1653,7 @@ static s32 obj_is_in_view(struct GraphNodeObject *node, Mat4 matrix) {
+         return FALSE;
+     } else if (node->skipInViewCheck) {
+         return TRUE;
+-    } else if (gArMode) {
++    } else if (gArMode && !gfx_ar_menu_scene()) {
+         return TRUE;   /* AR: the view is identity, not Lakitu's; the whole diorama is in view */
+     }
+ 
+@@ -1855,7 +1868,7 @@ static void geo_process_object_body(struct Object *node) {
+                          scalePrev);
+         node->header.gfx.throwMatrix = &gMatStack[++gMatStackIndex];
+         node->header.gfx.throwMatrixPrev = &gMatStackPrev[gMatStackIndex];
+-        if (AR_GAME_HOOK(listener_vector)) {   /* AR: sounds pan and attenuate relative to the head */
++        if (AR_GAME_HOOK(listener_vector) && !gfx_ar_menu_scene()) {   /* AR: sounds pan and attenuate relative to the head */
+             gArGameHooks->listener_vector(node->header.gfx.cameraToObject, gMatStack[gMatStackIndex][3]);
+         } else {
+             node->header.gfx.cameraToObject[0] = gMatStack[gMatStackIndex][3][0];
+diff --git a/src/game/screen_transition.c b/src/game/screen_transition.c
+index 5c3ad15..f90fe41 100644
+--- a/src/game/screen_transition.c
++++ b/src/game/screen_transition.c
+@@ -14,6 +14,7 @@
+ #include "sm64.h"
+ #include "pc/utils/misc.h"
+ #include "hud.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ u8 sTransitionColorFadeCount[4] = { 0 };
+ u16 sTransitionTextureFadeCount[2] = { 0 };
+@@ -387,6 +388,7 @@ Gfx *render_cannon_circle_base(void) {
+ }
+ 
+ Gfx *geo_cannon_circle_base(s32 callContext, struct GraphNode *node, UNUSED Mat4 mtx) {
++    if (gArMode) { return NULL; }   /* AR: the trajectory arc replaces the screen-space cannon circle */
+     struct GraphNodeGenerated *graphNode = (struct GraphNodeGenerated *) node;
+     Gfx *dlist = NULL;
+ 
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index e119fea..2624a01 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -23,7 +23,7 @@ enum { GFX_AR_MAT_LIT = 1, GFX_AR_MAT_TEXGEN = 2 };
+ enum { GFX_AR_SPACE_SCREEN = 0, GFX_AR_SPACE_WORLD = 1, GFX_AR_SPACE_DISCARD = 2 };
+ enum { GFX_AR_CULL_NONE = 0, GFX_AR_CULL_BACK = 1, GFX_AR_CULL_FRONT = 2 };
+ enum { GFX_AR_GROUP_MISC = 1, GFX_AR_GROUP_COUNTERS = 2, GFX_AR_GROUP_POWER_METER = 3,
+-       GFX_AR_GROUP_DIALOG = 4, GFX_AR_GROUP_PAUSE = 5 };
++       GFX_AR_GROUP_DIALOG = 4, GFX_AR_GROUP_PAUSE = 5, GFX_AR_GROUP_LABELS = 6, GFX_AR_GROUP_TIMER = 7 };
+ 
+ struct GfxArHooks {
+     void (*set_space)(int space);      /* GFX_AR_SPACE_*, after the pending batch was flushed */
+@@ -67,6 +67,19 @@ extern bool gArStory;
+ enum { GFX_AR_SCREEN_LEVEL = 0, GFX_AR_SCREEN_TITLE = 1, GFX_AR_SCREEN_FILE_SELECT = 2, GFX_AR_SCREEN_ACT_SELECT = 3,
+        GFX_AR_SCREEN_CAKE = 4 };
+ extern int gArScreen;
++/* the menu screens (file select, act selector, cake) in story mode are a "screen scene": their real camera, vanilla
++ * culling and SCREEN tags, the whole screen inside overlay group MENU (one panel over the table). Everything else keeps the
++ * AR world rules. This is the only switch between the two. */
++enum { GFX_AR_GROUP_MENU = 8 };
++/* the intro picture-in-picture (Lakitu's view). While gArPipSky is set (the host sets it, render-only), a level's
++ * background node draws vanilla's skybox or fill colour again, inside overlay group PIP: the PiP's background. */
++enum { GFX_AR_GROUP_PIP = 12 };
++extern bool gArPipSky;
++enum { GFX_AR_GROUP_CREDITS = 9 };
++static inline bool gfx_ar_menu_scene(void) {
++    return gArMode && gArStory &&
++           (gArScreen == GFX_AR_SCREEN_FILE_SELECT || gArScreen == GFX_AR_SCREEN_ACT_SELECT || gArScreen == GFX_AR_SCREEN_CAKE);
++}
+ extern unsigned gArLevelInits;
+ 
+ /* Game code: emit a tag into the display list being built. No-op unless gArMode. */

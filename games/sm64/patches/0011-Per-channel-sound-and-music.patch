@@ -1,0 +1,449 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Per-channel sound and music
+
+Lets the host place sounds in space instead of hearing SM64's stereo mix
+(src/audio/ar_audio_hooks.h). Inert unless gArMode and the host's flags.
+
+- spatial SFX: notes of point-source SFX channels are mixed at centre gain
+  into per-channel mono accumulators instead of the stereo mix, and those
+  channels lose SM64's pan, distance volume loss and pitch rise; the host
+  reads each channel's sound, bank and listener-space vector and spatializes
+  it. The reverb send can keep vanilla's distance term (gArReverbOriginal).
+- music: the level sequence's channels, and the environment player's
+  channels while an event song plays, can be split per channel the same
+  way; their reverb send stays in the stereo bed.
+- every note keeps its channel tag whenever gArMode, so switching sound
+  mode live does not lose notes already playing.
+
+The host reads the accumulators once per tick after buffer_audio() and then
+calls ar_sfx_tick_reset(). All globals are written on the game thread only.
+---
+ src/audio/ar_audio_hooks.h |  51 ++++++++++++++++
+ src/audio/external.c       |  75 +++++++++++++++++++++---
+ src/audio/internal.h       |   4 +-
+ src/audio/playback.c       |   3 +
+ src/audio/synthesis.c      | 115 ++++++++++++++++++++++++++++++++++++-
+ src/pc/pc_main.c           |   2 +
+ 6 files changed, 241 insertions(+), 9 deletions(-)
+
+diff --git a/src/audio/ar_audio_hooks.h b/src/audio/ar_audio_hooks.h
+index e69de29..2ac6486 100644
+--- a/src/audio/ar_audio_hooks.h
++++ b/src/audio/ar_audio_hooks.h
+@@ -0,0 +1,51 @@
++#ifndef AR_AUDIO_HOOKS_H
++#define AR_AUDIO_HOOKS_H
++/* AR spatial SFX seams (0011-Per-channel-sound-and-music.patch). Inert unless gArMode && gArSpatialSfx. Then the notes of spatial
++ * SFX channels are env-mixed at centre gain into per-channel mono accumulators instead of the stereo mix, and those
++ * channels lose SM64's pan, distance volume loss and distance pitch rise: the platform spatializes them. notes
++ * of level-music channels are split the same way while gArSpatialMusic; their reverb send stays in the bed. The host
++ * reads the accumulators once per tick, after buffer_audio() played the tick, and then calls ar_sfx_tick_reset().
++ * Threading: every global below is written only on the game thread, between buffer_audio() calls (never while a buffer
++ * is synthesized), so a note's pan pass and its envelope step see the same classification. */
++#include <stdbool.h>
++#include <PR/ultratypes.h>
++struct SequenceChannel;
++#define AR_SFX_CHANNELS 72          /* CHANNELS_MAX (internal.h): the SFX sequence player's channels, one per (bank, slot) */
++#define AR_SFX_TICK_FRAMES 1088     /* 2 * SAMPLES_HIGH (pc_main.c): the most frames one buffer_audio() makes */
++extern bool gArSpatialSfx;                                     /* host, before the first tick: spatial SFX mode */
++extern bool gArSfxAllowSpatial;
++extern u8   gArSfxChannelSpatial[AR_SFX_CHANNELS];
++extern f32  gArSfxAccum[AR_SFX_CHANNELS][AR_SFX_TICK_FRAMES];  /* mono at unity (s16 scale), this tick's frames */
++extern u8   gArSfxActive[AR_SFX_CHANNELS];
++extern s32  gArSfxFrames;
++extern u32  gArSfxOverflow;
++u8   ar_sfx_channel_tag(struct SequenceChannel *ch);
++void ar_sfx_tick_reset(void);
++#define AR_MUSIC_CHANNELS 16
++extern bool gArSpatialMusic;        /* host, between ticks, game thread: split the level music per channel (spatial mode only) */
++extern f32  gArMusicAccum[AR_MUSIC_CHANNELS][AR_SFX_TICK_FRAMES];   /* mono at unity (s16 scale), this tick's frames */
++extern u8   gArMusicActive[AR_MUSIC_CHANNELS];
++u8   ar_music_channel_tag(struct SequenceChannel *ch);
++struct ArSfxChannelInfo {
++    u8 has_sound;
++    u8 spatial;
++    u8 bank;
++    u8 no_volume_loss;
++    u32 soundBits;
++    const f32 *source;    /* the emitter's position pointer: identity only (compare, never dereference) */
++    f32 vec[3];           /* the listener-space vector update_game_sound read (AR: the head listener vector) */
++};
++void ar_sfx_channel_info(s32 channel, struct ArSfxChannelInfo *out);
++/* from here on ar_sfx_channel_tag / ar_music_channel_tag tag a note whenever gArMode (the mix still checks the
++ * flags), so a note started in one sound mode is tapped after a live switch. gArReverbOriginal (host, between ticks): a
++ * spatial SFX channel's reverb send keeps vanilla's distance term ((1 - the volume vanilla would set) x LOW_VOLUME_REVERB);
++ * false (default): the send as at the listener (distance-free volume). */
++extern bool gArReverbOriginal;
++/* the environment player's channels are tagged too (arMusicChannel 17..32; 1..16 stay SEQ_PLAYER_LEVEL's) and,
++ * while gArSpatialEnvMusic (host, between ticks: an event song plays and the user wants it on the ring), split per channel
++ * into gArEnvAccum like the level music; their reverb send stays in the bed. Cleared by ar_sfx_tick_reset. */
++#define AR_ENV_CHANNELS 16
++extern bool gArSpatialEnvMusic;
++extern f32  gArEnvAccum[AR_ENV_CHANNELS][AR_SFX_TICK_FRAMES];
++extern u8   gArEnvActive[AR_ENV_CHANNELS];
++#endif
+diff --git a/src/audio/external.c b/src/audio/external.c
+index 1d5fde0..b15e700 100644
+--- a/src/audio/external.c
++++ b/src/audio/external.c
+@@ -13,6 +13,8 @@
+ #include "game/camera.h"
+ #include "game/hardcoded.h"
+ #include "seq_ids.h"
++#include "ar_audio_hooks.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ #include "dialog_ids.h"
+ #include "level_table.h"
+ #include "pc/debuglog.h"
+@@ -451,6 +453,54 @@ u8 sBackgroundMusicTargetVolume;
+ static u8 sLowerBackgroundMusicVolume;
+ struct SequenceQueueItem sBackgroundMusicQueue[MAX_BACKGROUND_MUSIC_QUEUE_SIZE] = { 0 };
+ 
++/* sArSpatialNow is set while update_game_sound updates a spatial channel. */
++static u8 sArSpatialNow;
++static struct ArSfxChannelInfo sArChannel[AR_SFX_CHANNELS];
++/* the game-reverb seam. sArVolumeOriginal: the volume vanilla would have set on each spatial channel (its
++ * real listener distance), refreshed every tick; get_sound_reverb reads it with gArReverbOriginal. Two approximations,
++ * audible only with Original: the MOVING bank's volume leaves out vanilla's (speed + 8) / 16 factor below speed 8 (so
++ * the send is a little higher than vanilla's there), and a channel's first tick with a new sound reads the value its
++ * previous sound left (0 before any: +LOW_VOLUME_REVERB for that tick), as vanilla's own send lags one tick. */
++bool gArReverbOriginal = false;
++static f32 sArVolumeOriginal[AR_SFX_CHANNELS];
++static f32 ar_volume_range(u8 bank) {
++    switch (bank) {
++        case SOUND_BANK_GENERAL: case SOUND_BANK_ENV: case SOUND_BANK_OBJ: case SOUND_BANK_AIR: case SOUND_BANK_GENERAL2:
++        case SOUND_BANK_OBJ2: return VOLUME_RANGE_UNK2;
++        default: return VOLUME_RANGE_UNK1;
++    }
++}
++static u8 ar_sfx_classify(u8 bank, u8 soundIndex) {
++    if (!(gArMode && gArSpatialSfx && gArSfxAllowSpatial)) { return 0; }
++    if (bank == SOUND_BANK_MENU) { return 0; }                                      /* menu and UI: the bed */
++    const struct SoundCharacteristics *s = &sSoundBanks[bank][soundIndex];
++    if (s->x == &gGlobalSoundSource[0]) { return 0; }                               /* "at the listener": the bed */
++    if (bank == SOUND_BANK_MOVING && (s->soundBits & SOUND_CONSTANT_FREQUENCY)) { return 0; }   /* vanilla: non-positional */
++    return 1;
++}
++static u8 ar_sfx_update_channel(u8 channel, u8 bank, u8 soundIndex) {
++    if (!gArMode || channel >= AR_SFX_CHANNELS) { return 0; }
++    struct ArSfxChannelInfo *c = &sArChannel[channel];
++    c->bank = bank;
++    if (soundIndex >= SOUND_INDEX_COUNT || sSoundBanks[bank][soundIndex].soundStatus == SOUND_STATUS_STOPPED) {
++        c->has_sound = 0;          /* no current sound: classification and position hold (release tails) */
++        return 0;
++    }
++    const struct SoundCharacteristics *s = &sSoundBanks[bank][soundIndex];
++    c->has_sound = 1;
++    c->soundBits = s->soundBits;
++    c->source = s->x;
++    c->no_volume_loss = (s->soundBits & SOUND_NO_VOLUME_LOSS) != 0;
++    c->vec[0] = *s->x; c->vec[1] = *s->y; c->vec[2] = *s->z;   /* the same read get_sound_pan makes below */
++    c->spatial = ar_sfx_classify(bank, soundIndex);
++    gArSfxChannelSpatial[channel] = c->spatial;
++    return c->spatial;
++}
++void ar_sfx_channel_info(s32 channel, struct ArSfxChannelInfo *out) {
++    if (channel < 0 || channel >= AR_SFX_CHANNELS) { memset(out, 0, sizeof(*out)); return; }
++    *out = sArChannel[channel];
++}
++
+ #if defined(VERSION_EU) || defined(VERSION_SH)
+ s32 unk_sh_8034754C;
+ #endif
+@@ -1217,6 +1267,9 @@ static void select_current_sounds(u8 bank) {
+  * Called from threads: thread4_sound, thread5_game_loop (EU only)
+  */
+ f32 get_sound_pan(f32 x, f32 z) {
++    /* the platform pans. sArSpatialNow is set only inside update_game_sound's channel loop and cleared
++     * before it moves on; this relies on the single game thread (get_sound_pan is also Lua-exported, smlua_audio_utils.c). */
++    if (sArSpatialNow) { return US_FLOAT(0.5); }
+     f32 absX;
+     f32 absZ;
+     f32 pan;
+@@ -1280,17 +1333,18 @@ static f32 get_sound_volume(u8 bank, u8 soundIndex, f32 volumeRange) {
+ #else
+         // Intensity linearly lowers from 1 at the camera to 1 - volumeRange at maxSoundDistance,
+         // then it goes from 1 - volumeRange at maxSoundDistance to 0 at AUDIO_MAX_DISTANCE
+-        if (sSoundBanks[bank][soundIndex].distance > AUDIO_MAX_DISTANCE) {
++        const f32 distance = sArSpatialNow ? 0.0f : sSoundBanks[bank][soundIndex].distance;
++        if (distance > AUDIO_MAX_DISTANCE) {
+             intensity = 0.0f;
+         } else {
+             maxSoundDistance = get_level_acoustic_reaches(gCurrLevelNum) / div;
+-            if (maxSoundDistance < sSoundBanks[bank][soundIndex].distance) {
+-                intensity = ((AUDIO_MAX_DISTANCE - sSoundBanks[bank][soundIndex].distance)
++            if (maxSoundDistance < distance) {
++                intensity = ((AUDIO_MAX_DISTANCE - distance)
+                              / (AUDIO_MAX_DISTANCE - maxSoundDistance))
+                             * (1.0f - volumeRange);
+             } else {
+                 intensity =
+-                    1.0f - sSoundBanks[bank][soundIndex].distance / maxSoundDistance * volumeRange;
++                    1.0f - distance / maxSoundDistance * volumeRange;
+             }
+         }
+ #endif
+@@ -1321,7 +1375,7 @@ static f32 get_sound_freq_scale(u8 bank, u8 item) {
+     f32 amount;
+ 
+     if (!(sSoundBanks[bank][item].soundBits & SOUND_CONSTANT_FREQUENCY)) {
+-        amount = sSoundBanks[bank][item].distance / AUDIO_MAX_DISTANCE;
++        amount = (sArSpatialNow ? 0.0f : sSoundBanks[bank][item].distance) / AUDIO_MAX_DISTANCE;
+         if (sSoundBanks[bank][item].soundBits & SOUND_VIBRATO) {
+             amount += (f32)(gAudioRandom & 0xff) / US_FLOAT(64.0);
+         }
+@@ -1362,10 +1416,11 @@ static u8 get_sound_reverb(UNUSED u8 bank, UNUSED u8 soundIndex, u8 channelIndex
+     // reverb = reverb adjustment + level reverb + a volume-dependent value
+     // The volume-dependent value is 0 when volume is at maximum, and raises to
+     // LOW_VOLUME_REVERB when the volume is 0
++    f32 arVolume = gSequencePlayers[SEQ_PLAYER_SFX].channels[channelIndex]->volume;
++    if (gArMode && gArReverbOriginal && sArSpatialNow) { arVolume = sArVolumeOriginal[channelIndex]; }
+     reverb = (u8)((u8) gSequencePlayers[SEQ_PLAYER_SFX].channels[channelIndex]->soundScriptIO[5]
+                   + get_level_area_reverb(level, area)
+-                  + (US_FLOAT(1.0) - gSequencePlayers[SEQ_PLAYER_SFX].channels[channelIndex]->volume)
+-                        * LOW_VOLUME_REVERB);
++                  + (US_FLOAT(1.0) - arVolume) * LOW_VOLUME_REVERB);
+ 
+     if (reverb > 0x7f) {
+         reverb = 0x7f;
+@@ -1416,6 +1471,7 @@ static void update_game_sound(void) {
+ 
+         for (i = 0; i < sUsedChannelsForSoundBank[bank]; i++) {
+             soundIndex = sCurrentSound[bank][i];
++            sArSpatialNow = ar_sfx_update_channel(channelIndex, bank, soundIndex);
+ 
+             if (soundIndex < SOUND_INDEX_COUNT && sSoundBanks[bank][soundIndex].soundStatus != SOUND_STATUS_STOPPED) {
+                 soundStatus = sSoundBanks[bank][soundIndex].soundBits & SOUNDARGS_MASK_STATUS;
+@@ -1762,7 +1818,12 @@ static void update_game_sound(void) {
+ #endif
+             }
+ 
++            if (sArSpatialNow) {   /* what vanilla would have set (read-only maths), for "Original" next tick */
++                sArSpatialNow = 0;
++                sArVolumeOriginal[channelIndex] = get_sound_volume(bank, soundIndex, ar_volume_range(bank));
++            }
+             // Increment to the next channel that this bank owns
++            sArSpatialNow = 0;
+             channelIndex++;
+         }
+ 
+diff --git a/src/audio/internal.h b/src/audio/internal.h
+index badfac5..91a8632 100644
+--- a/src/audio/internal.h
++++ b/src/audio/internal.h
+@@ -732,7 +732,9 @@ struct Note
+     /*0xA0*/ s16 reverbVol;
+     /*0xA2*/ s16 unused2; // never read, set to 0
+     /*0xA4, 0x00*/ struct AudioListItem listItem;
+-    /*          */ u8 pad2[0xc];
++    /*          */ u8 arSfxChannel; // 1 + SFX channel index of the note's layer (0 = none); size unchanged
++    /*          */ u8 arMusicChannel; // 1 + SEQ_PLAYER_LEVEL channel index of the note's layer (0 = none)
++    /*          */ u8 pad2[0xa];
+ }; // size = 0xC0
+ #endif
+ 
+diff --git a/src/audio/playback.c b/src/audio/playback.c
+index d1368ac..26cb03c 100644
+--- a/src/audio/playback.c
++++ b/src/audio/playback.c
+@@ -8,6 +8,7 @@
+ #include "synthesis.h"
+ #include "effects.h"
+ #include "external.h"
++#include "ar_audio_hooks.h"
+ 
+ void note_set_resampling_rate(struct Note *note, f32 resamplingRateInput);
+ 
+@@ -1153,6 +1154,8 @@ void note_init_for_layer(struct Note *note, struct SequenceChannelLayer *seqLaye
+ s32 note_init_for_layer(struct Note *note, struct SequenceChannelLayer *seqLayer) {
+     note->prevParentLayer = NO_LAYER;
+     note->parentLayer = seqLayer;
++    note->arSfxChannel = ar_sfx_channel_tag(seqLayer->seqChannel);   /* survives the release tail */
++    note->arMusicChannel = ar_music_channel_tag(seqLayer->seqChannel);   /* survives the release tail */
+     note->priority = seqLayer->seqChannel->notePriority;
+     if (IS_BANK_LOAD_COMPLETE(seqLayer->seqChannel->bankId) == FALSE) {
+         return TRUE;
+diff --git a/src/audio/synthesis.c b/src/audio/synthesis.c
+index 862d512..9ab7f03 100644
+--- a/src/audio/synthesis.c
++++ b/src/audio/synthesis.c
+@@ -8,6 +8,8 @@
+ #include "external.h"
+ 
+ #include "../pc/mixer.h"
++#include "ar_audio_hooks.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ #ifndef VERSION_SH
+ #define DMEM_ADDR_TEMP 0x0
+@@ -78,6 +80,92 @@ u64 *process_envelope_inner(u64 *cmd, struct Note *note, s32 nSamples, u16 inBuf
+ u64 *note_apply_headset_pan_effects(u64 *cmd, struct Note *note, s32 bufLen, s32 flags, s32 leftRight);
+ #endif
+ 
++/* spatial SFX. Inert unless gArMode && gArSpatialSfx (ar_audio_hooks.h). */
++bool gArSpatialSfx = false;
++bool gArSfxAllowSpatial = true;
++u8 gArSfxChannelSpatial[AR_SFX_CHANNELS];
++f32 gArSfxAccum[AR_SFX_CHANNELS][AR_SFX_TICK_FRAMES];
++u8 gArSfxActive[AR_SFX_CHANNELS];
++s32 gArSfxFrames;
++u32 gArSfxOverflow;
++static s32 sArChunkStart;
++_Static_assert(AR_SFX_CHANNELS == CHANNELS_MAX, "one accumulator per SFX sequence channel");
++u8 ar_sfx_channel_tag(struct SequenceChannel *ch) {
++    if (!gArMode || ch == NULL || ch->seqPlayer != &gSequencePlayers[SEQ_PLAYER_SFX]) { return 0; }   /* whatever the flags */
++    for (s32 i = 0; i < AR_SFX_CHANNELS; i++) {
++        if (gSequencePlayers[SEQ_PLAYER_SFX].channels[i] == ch) { return (u8) (i + 1); }
++    }
++    return 0;
++}
++/* the level music per channel. Inert unless gArMode && gArSpatialSfx && gArSpatialMusic. */
++bool gArSpatialMusic = false;
++f32 gArMusicAccum[AR_MUSIC_CHANNELS][AR_SFX_TICK_FRAMES];
++u8 gArMusicActive[AR_MUSIC_CHANNELS];
++#define AR_MUSIC_TARGET 128   /* ar_note_target(): 0..71 an SFX channel, AR_MUSIC_TARGET + c a music channel */
++_Static_assert(AR_MUSIC_TARGET >= AR_SFX_CHANNELS, "music targets follow the SFX channels");
++/* the environment player's event music per channel. */
++bool gArSpatialEnvMusic = false;
++f32 gArEnvAccum[AR_ENV_CHANNELS][AR_SFX_TICK_FRAMES];
++u8 gArEnvActive[AR_ENV_CHANNELS];
++#define AR_ENV_TARGET (AR_MUSIC_TARGET + AR_MUSIC_CHANNELS)
++u8 ar_music_channel_tag(struct SequenceChannel *ch) {
++    if (!gArMode || ch == NULL) { return 0; }   /* whatever the flags */
++    for (s32 p = 0; p < 2; p++) {               /* SEQ_PLAYER_LEVEL 1..16, SEQ_PLAYER_ENV 17..32 */
++        const s32 player = p == 0 ? SEQ_PLAYER_LEVEL : SEQ_PLAYER_ENV;
++        if (ch->seqPlayer != &gSequencePlayers[player]) { continue; }
++        for (s32 i = 0; i < AR_MUSIC_CHANNELS; i++) {
++            if (gSequencePlayers[player].channels[i] == ch) { return (u8) (1 + 16 * p + i); }
++        }
++    }
++    return 0;
++}
++void ar_sfx_tick_reset(void) {
++    for (s32 c = 0; c < AR_SFX_CHANNELS; c++) {
++        if (gArSfxActive[c]) { memset(gArSfxAccum[c], 0, sizeof(gArSfxAccum[c])); gArSfxActive[c] = 0; }
++    }
++    for (s32 c = 0; c < AR_MUSIC_CHANNELS; c++) {
++        if (gArMusicActive[c]) { memset(gArMusicAccum[c], 0, sizeof(gArMusicAccum[c])); gArMusicActive[c] = 0; }
++    }
++    for (s32 c = 0; c < AR_ENV_CHANNELS; c++) {
++        if (gArEnvActive[c]) { memset(gArEnvAccum[c], 0, sizeof(gArEnvAccum[c])); gArEnvActive[c] = 0; }
++    }
++    gArSfxFrames = 0;
++}
++#if defined(VERSION_JP) || defined(VERSION_US)
++static s16 sArDryL[DEFAULT_LEN_1CH / 2 + 8], sArDryR[DEFAULT_LEN_1CH / 2 + 8];   /* aSaveBuffer rounds up to 8 bytes */
++static s32 ar_sfx_note_channel(struct Note *note) {
++    if (!(gArMode && gArSpatialSfx && gArSfxAllowSpatial) || note->arSfxChannel == 0) { return -1; }
++    const s32 c = note->arSfxChannel - 1;
++    return gArSfxChannelSpatial[c] ? c : -1;
++}
++/* Where a note is mixed: an SFX channel (0..71), a music channel (AR_MUSIC_TARGET + c), or the bed (-1). */
++static s32 ar_note_target(struct Note *note) {
++    const s32 c = ar_sfx_note_channel(note);
++    if (c >= 0) { return c; }
++    const s32 t = note->arMusicChannel;
++    if (!(gArMode && gArSpatialSfx) || t == 0) { return -1; }
++    if (t <= AR_MUSIC_CHANNELS) { return gArSpatialMusic ? AR_MUSIC_TARGET + t - 1 : -1; }
++    return gArSpatialEnvMusic ? AR_ENV_TARGET + t - 1 - AR_MUSIC_CHANNELS : -1;
++}
++/* After the env mixer put the note's dry signal into the scratch pair: read it back and add (L + R) / sqrt(2), the note
++ * at unity under the centre pan law, into the target's accumulator (float: notes of one source never clip each other).
++ * ch is an ar_note_target(): an SFX channel or AR_MUSIC_TARGET + a music channel. */
++static u64 *ar_sfx_save(u64 *cmd, s32 ch, s32 n) {
++    aSetBuffer(cmd++, 0, 0, DMEM_ADDR_STEREO_STRONG_TEMP_DRY, n * 2);
++    aSaveBuffer(cmd++, sArDryL);
++    aSetBuffer(cmd++, 0, 0, DMEM_ADDR_STEREO_STRONG_TEMP_WET, n * 2);
++    aSaveBuffer(cmd++, sArDryR);
++    const s32 at = sArChunkStart;
++    if (at < 0 || at + n > AR_SFX_TICK_FRAMES) { gArSfxOverflow += (u32) n; return cmd; }
++    f32 *acc = ch >= AR_ENV_TARGET ? &gArEnvAccum[ch - AR_ENV_TARGET][at]
++             : ch >= AR_MUSIC_TARGET ? &gArMusicAccum[ch - AR_MUSIC_TARGET][at] : &gArSfxAccum[ch][at];
++    for (s32 i = 0; i < n; i++) { acc[i] += ((f32) sArDryL[i] + (f32) sArDryR[i]) * 0.70710678f; }
++    if (ch >= AR_ENV_TARGET) { gArEnvActive[ch - AR_ENV_TARGET] = 1; }
++    else if (ch >= AR_MUSIC_TARGET) { gArMusicActive[ch - AR_MUSIC_TARGET] = 1; } else { gArSfxActive[ch] = 1; }
++    return cmd;
++}
++#endif
++
+ #if defined(VERSION_EU) || defined(VERSION_SH)
+ struct SynthesisReverb gSynthesisReverbs[4];
+ u8 sAudioSynthesisPad[0x10];
+@@ -408,7 +496,9 @@ u64 *synthesis_execute(u64 *cmdBuf, s32 *writtenCmds, s16 *aiBuf, s32 bufLen) {
+         if (gSynthesisReverb.useReverb != 0) {
+             prepare_reverb_ring_buffer(chunkLen, gAudioUpdatesPerFrame - i);
+         }
++        if (gArMode && gArSpatialSfx) { sArChunkStart = gArSfxFrames; }   /* where this chunk lands in the tick */
+         cmd = synthesis_do_one_audio_update((s16 *) aiBufPtr, chunkLen, cmd, gAudioUpdatesPerFrame - i);
++        if (gArMode && gArSpatialSfx) { gArSfxFrames += chunkLen; }
+         bufLen -= chunkLen;
+         aiBufPtr += chunkLen;
+     }
+@@ -1742,6 +1832,18 @@ u64 *process_envelope(u64 *cmd, struct NoteSubEu *note, struct NoteSynthesisStat
+     // in, dry left, count without A_AUX flag.
+     // dry right, wet left, wet right with A_AUX flag.
+ 
++#if defined(VERSION_JP) || defined(VERSION_US)
++    /* arCh: the note's SFX or music target. A note still carrying stereo-strong or headset flags (its
++     * pan pass saw another classification; the threading rule in ar_audio_hooks.h forbids that) stays in the bed: those
++     * paths reuse the scratch pair below. */
++    const s32 arCh = (note->stereoStrongLeft || note->stereoStrongRight || note->usesHeadsetPanEffects)
++                         ? -1 : ar_note_target(note);
++    if (arCh >= 0) {   /* dry into the cleared scratch pair (free here: stereo-strong is off for this note); wet into the reverb */
++        aClearBuffer(cmd++, DMEM_ADDR_STEREO_STRONG_TEMP_DRY, DEFAULT_LEN_2CH);
++        aSetBuffer(cmd++, 0, inBuf, DMEM_ADDR_STEREO_STRONG_TEMP_DRY, nSamples * 2);
++        aSetBuffer(cmd++, A_AUX, DMEM_ADDR_STEREO_STRONG_TEMP_WET, DMEM_ADDR_WET_LEFT_CH, DMEM_ADDR_WET_RIGHT_CH);
++    } else
++#endif
+     if (note->usesHeadsetPanEffects) {
+         aClearBuffer(cmd++, DMEM_ADDR_NOTE_PAN_TEMP, DEFAULT_LEN_1CH);
+ 
+@@ -1855,6 +1957,9 @@ u64 *process_envelope(u64 *cmd, struct NoteSubEu *note, struct NoteSynthesisStat
+                  /*out*/ DMEM_ADDR_RIGHT_CH);
+         }
+     }
++#if defined(VERSION_JP) || defined(VERSION_US)
++    if (arCh >= 0) { cmd = ar_sfx_save(cmd, arCh, nSamples); }
++#endif
+     return cmd;
+ }
+ 
+@@ -2121,7 +2226,15 @@ void note_set_vel_pan_reverb(struct Note *note, f32 velocity, f32 pan, u8 reverb
+ #else
+     panIndex = (s32)(pan * 127.5f) & 127;
+ #endif
+-    if (note->stereoHeadsetEffects && gSoundMode == SOUND_MODE_HEADSET) {
++    if (ar_note_target(note) >= 0) {   /* mono at centre, no stereo or headset effects: the platform pans */
++        note->headsetPanLeft = 0;
++        note->headsetPanRight = 0;
++        note->stereoStrongRight = FALSE;
++        note->stereoStrongLeft = FALSE;
++        note->usesHeadsetPanEffects = FALSE;
++        volLeft = gDefaultPanVolume[63];
++        volRight = gDefaultPanVolume[64];
++    } else if (note->stereoHeadsetEffects && gSoundMode == SOUND_MODE_HEADSET) {
+         s8 smallPanIndex;
+         s8 temp = (s8)(pan * 10.0f);
+         if (temp < 9) {
+diff --git a/src/pc/pc_main.c b/src/pc/pc_main.c
+index 36dc6cf..8e53cd7 100644
+--- a/src/pc/pc_main.c
++++ b/src/pc/pc_main.c
+@@ -12,6 +12,7 @@
+ #include "game/memory.h"
+ #include "audio/data.h"
+ #include "audio/external.h"
++#include "audio/ar_audio_hooks.h"
+ 
+ #include "network/network.h"
+ #include "lua/smlua.h"
+@@ -128,6 +129,7 @@ void send_display_list(struct SPTask *spTask) {
+ #define SAMPLES_HIGH 544
+ #define SAMPLES_LOW 528
+ #endif
++_Static_assert(AR_SFX_TICK_FRAMES == 2 * SAMPLES_HIGH, "one buffer_audio() makes at most 2 * SAMPLES_HIGH frames");
+ 
+ extern void patch_mtx_before(void);
+ extern void patch_screen_transition_before(void);

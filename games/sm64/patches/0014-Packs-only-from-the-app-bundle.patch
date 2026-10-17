@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Packs only from the app bundle
+
+When the host sets gArDynosExtraPacksFolder (the visionOS app: its
+bundle's packs), DynOS scans that folder instead of the user folder,
+so the app never loads a pack from its save folder. Without it (the
+macOS harness, upstream) nothing changes.
+---
+ data/dynos_gfx_init.cpp   | 8 ++++++--
+ src/pc/gfx/gfx_ar_hooks.h | 3 +++
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/data/dynos_gfx_init.cpp b/data/dynos_gfx_init.cpp
+index 70e010b..3fdf373 100644
+--- a/data/dynos_gfx_init.cpp
++++ b/data/dynos_gfx_init.cpp
+@@ -97,9 +97,13 @@ void DynOS_Gfx_Init() {
+     SysPath _DynosPacksFolder = fstring("%s/%s", DYNOS_EXE_FOLDER, DYNOS_PACKS_FOLDER);
+     ScanPacksFolder(_DynosPacksFolder);
+ 
++    // AR: an app with its packs in its bundle loads packs only from there, never from the user folder (the save folder)
++    if (gArDynosExtraPacksFolder && *gArDynosExtraPacksFolder) {
++        ScanPacksFolder(SysPath(gArDynosExtraPacksFolder));
++        return;
++    }
++
+     // Scan the user path folder
+     SysPath _DynosPacksUserFolder = fstring("%s%s", DYNOS_USER_FOLDER, DYNOS_PACKS_FOLDER);
+     ScanPacksFolder(_DynosPacksUserFolder);
+-
+-    if (gArDynosExtraPacksFolder && *gArDynosExtraPacksFolder) { ScanPacksFolder(SysPath(gArDynosExtraPacksFolder)); }
+ }
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index b4aa5c9..177121f 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -50,6 +50,9 @@ extern bool (*gArDynosPackFileAllowed)(const char *packDir, const char *file);
+ /* final, with gArDynosPacksOnly: pack files the loader refused or cut short by a size bound (an absurd declared
+    decompressed length or file size, an element count past the end of the file). Cumulative. */
+ extern uint32_t gArDynosBinRefused;
++/* AR: the visionOS app's read-only pack folder (its bundle's packs). When set, DynOS scans it instead of the user folder
++   (the save folder's dynos/packs), after the game's own; a pack name already found keeps the earlier folder's pack.
++   NULL: none (upstream: the user folder). */
+ extern const char *gArDynosExtraPacksFolder;
+ extern bool gArDrawAllRooms;
+ /* With gArMode and gArDrawAllRooms: objects in rooms other than Mario's. HIDDEN: vanilla (not drawn, not updated);

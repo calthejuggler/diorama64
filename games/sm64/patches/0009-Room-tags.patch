@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Room tags
+
+With gArMode and gArDrawAllRooms, each room case of a room switch and each
+object's draws are wrapped in a ROOM tag naming their room, so the host can
+hide or reveal rooms as they are visited. An object's room is the room of
+the floor it last stood on, else the one it spawned in, else the one the
+host gives it (gArObjectRoomFallback: the room vanilla's bhv_init_room
+would give it). Tags only: what the graph processes is unchanged.
+
+The host is also told when a save file is erased or copied
+(gArSaveFileEvent), so its per-file data follows the slot.
+---
+ src/engine/graph_node.h         |  1 +
+ src/game/ar_game_hooks.h        |  8 ++++++++
+ src/game/rendering_graph_node.c | 36 +++++++++++++++++++++++++++++++++
+ src/game/save_file.c            |  4 ++++
+ src/pc/gfx/gfx_ar_hooks.h       |  3 +++
+ src/pc/gfx/gfx_pc.c             |  2 ++
+ 6 files changed, 54 insertions(+)
+
+diff --git a/src/engine/graph_node.h b/src/engine/graph_node.h
+index 9c77f22..7e8cb13 100644
+--- a/src/engine/graph_node.h
++++ b/src/engine/graph_node.h
+@@ -136,6 +136,7 @@ struct DisplayListNode
+     u8 usingCamSpace;
+     u8 arFocus;   /* AR: 0, or player index + 1 when the list is that player's own geometry (silhouette) */
+     u8 arRole;    /* AR: GFX_AR_ROLE_* (terrain, object, blob shadow) for lighting */
++    u8 arRoom;    /* AR: the room (1..255) of a room-switched area the list belongs to, 0 = none */
+ };
+ 
+ /** GraphNode that manages the 8 top-level display lists that will be drawn
+diff --git a/src/game/ar_game_hooks.h b/src/game/ar_game_hooks.h
+index 72d8b10..d835272 100644
+--- a/src/game/ar_game_hooks.h
++++ b/src/game/ar_game_hooks.h
+@@ -28,5 +28,13 @@ extern s8 gArLevelEntryArea;
+ extern u32 gArAutoSaveCount;
+ extern u8 gArAutoSaveCourse, gArAutoSaveStar;
+ void ar_note_auto_save(void);
++/* with gArMode, called after a save file was erased (src -1, dst the erased file index) or copied (src to dst),
++ * so the host's per-file sidecars follow the slot. NULL = none (upstream). */
++extern void (*gArSaveFileEvent)(s32 src, s32 dst);
++/* rooms: with gArMode and gArDrawAllRooms, the room an object with none of its own (no oFloorRoom, no oRoom) draws in:
++ * the room vanilla's bhv_init_room would give it, as the host looked it up (read-only) on its tick; 0: none (drawn as
++ * before). NULL = none (upstream). */
++struct Object;
++extern s32 (*gArObjectRoomFallback)(struct Object *obj);
+ #define AR_GAME_HOOK(name) (gArMode && gArGameHooks != NULL && gArGameHooks->name != NULL)
+ #endif
+diff --git a/src/game/rendering_graph_node.c b/src/game/rendering_graph_node.c
+index bf285eb..4670097 100644
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -582,6 +582,12 @@ static u8 increment_mat_stack(void) {
+     return TRUE;
+ }
+ 
++/* AR: the room the display lists appended now belong to (0: none). With Draw all rooms each room case of a room
++ * switch, and each object with a room (oRoom > 0: only the levels with rooms set one), appends its lists with its room, and
++ * the master list draws them inside a ROOM tag naming it, so the host can hide or fade a room's draws ("Reveal rooms as you
++ * visit"). Tags only: what is processed is unchanged. */
++static int sArRoomTag = 0;
++static void ar_room_tag(int room) { sArRoomTag = room; }
+ /**
+  * Process a master list node.
+  */
+@@ -593,6 +599,7 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+     s32 arSpace = -1;
+     s32 arFocus = 0;
+     s32 arRole = -1;
++    s32 arRoom = 0;
+ 
+     // @bug This is where the LookAt values should be calculated but aren't.
+     // As a result, environment mapping is broken on Fast3DEX2 without the
+@@ -626,6 +633,10 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+                     gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_ROLE, currList->arRole));
+                     arRole = currList->arRole;
+                 }
++                if (gArMode && currList->arRoom != arRoom) {
++                    gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_ROOM, currList->arRoom));
++                    arRoom = currList->arRoom;
++                }
+                 detect_and_skip_mtx_interpolation(&currList->transform, &currList->transformPrev);
+ 
+                 struct MtxInterp *interp = growing_array_alloc(sMtxTbl, sizeof(struct MtxInterp));
+@@ -647,6 +658,9 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+     if (arFocus != 0) {
+         gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_FOCUS, 0));
+     }
++    if (arRoom != 0) {
++        gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_ROOM, 0));
++    }
+     if (arSpace == GFX_AR_SPACE_WORLD) {
+         gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_SPACE, GFX_AR_SPACE_SCREEN));
+     }
+@@ -682,6 +696,7 @@ static void geo_append_display_list(void *displayList, s16 layer) {
+         /* sArNoFocus is set exactly while a blob shadow list is appended (geo_process_shadow) */
+         listNode->arRole = sArNoFocus ? GFX_AR_ROLE_SHADOW : sArEffect ? GFX_AR_ROLE_EFFECT : sArLiquid ? (u8) sArLiquid
+                          : (gCurGraphNodeObject != NULL ? GFX_AR_ROLE_OBJECT : GFX_AR_ROLE_TERRAIN);
++        listNode->arRoom = (u8) sArRoomTag;
+         if (gCurGraphNodeMasterList->listHeads[layer] == 0) {
+             gCurGraphNodeMasterList->listHeads[layer] = listNode;
+         } else {
+@@ -870,11 +885,15 @@ static void geo_process_switch(struct GraphNodeSwitchCase *node) {
+     if (gArMode && gArDrawAllRooms && selectedChild != NULL && (void *) node->fnNode.func == (void *) geo_switch_area) {
+         struct GraphNode *outdoor = gArHideOutside ? ar_mario_indoors_outdoor_case(node) : NULL;
+         struct GraphNode *room = selectedChild;
++        const int prevTag = sArRoomTag;
++        int roomNum = 1;
+         do {
++            ar_room_tag(roomNum++ & 0xFF);
+             if (outdoor != NULL) { ar_show_outdoor_lists(room, outdoor, false); }
+             geo_process_node_and_siblings(room);   /* the parent is a switch: only this child */
+             if (outdoor != NULL) { ar_show_outdoor_lists(room, outdoor, true); }
+         } while ((room = room->next) != NULL && room != selectedChild);
++        ar_room_tag(prevTag);
+         return;
+     }
+     for (s32 i = 0; selectedChild != NULL && node->selectedCase > i; i++) {
+@@ -2165,7 +2184,24 @@ static void ar_pack_floor_tilt(struct Object *node, struct GraphNode *pack) {
+     mtxf_copy(sArLastTilt.m, *m);
+ }
+ 
++static void geo_process_object_packs(struct Object *node);
++s32 (*gArObjectRoomFallback)(struct Object *obj) = NULL;
+ static void geo_process_object(struct Object *node) {
++    /* AR: an object draws inside its room's tag: the room of the floor it last stood on (kept every tick by
++     * cur_obj_update_floor for the objects that move), else the room it was spawned in, else the room the host's
++     * gArObjectRoomFallback gives it (bhv_init_room's room, looked up read-only). Read only. */
++    s32 room = node->oFloorRoom > 0 ? node->oFloorRoom : node->oRoom;
++    if (gArMode && gArDrawAllRooms && room <= 0 && gArObjectRoomFallback != NULL) { room = gArObjectRoomFallback(node); }
++    if (!gArMode || !gArDrawAllRooms || room <= 0 || room > 0xFF) {
++        geo_process_object_packs(node);
++        return;
++    }
++    const int prevTag = sArRoomTag;
++    ar_room_tag(room);
++    geo_process_object_packs(node);
++    ar_room_tag(prevTag);
++}
++static void geo_process_object_packs(struct Object *node) {
+     struct GraphNode *pack = sArStatePass ? NULL : ar_pack_graph(node);
+     if (pack == NULL) {   /* no pack (or this is a state pass: vanilla all the way down) */
+         geo_process_object_body(node);
+diff --git a/src/game/save_file.c b/src/game/save_file.c
+index 0a9c6f0..061ef00 100644
+--- a/src/game/save_file.c
++++ b/src/game/save_file.c
+@@ -439,6 +439,8 @@ void save_file_do_save(s32 fileIndex, s8 forceSave) {
+     save_main_menu_data();
+ }
+ 
++void (*gArSaveFileEvent)(s32 src, s32 dst) = NULL;
++
+ void save_file_erase(s32 fileIndex) {
+     if (INVALID_FILE_INDEX(fileIndex)) { return; }
+ 
+@@ -448,6 +450,7 @@ void save_file_erase(s32 fileIndex) {
+ 
+     gSaveFileModified = TRUE;
+     save_file_do_save(fileIndex, TRUE);
++    if (gArMode && gArSaveFileEvent != NULL) { gArSaveFileEvent(-1, fileIndex); }
+ }
+ 
+ void save_file_reload(u8 loadAll) {
+@@ -483,6 +486,7 @@ BAD_RETURN(s32) save_file_copy(s32 srcFileIndex, s32 destFileIndex) {
+ 
+     gSaveFileModified = TRUE;
+     save_file_do_save(destFileIndex, TRUE);
++    if (gArMode && gArSaveFileEvent != NULL) { gArSaveFileEvent(srcFileIndex, destFileIndex); }
+ }
+ 
+ void save_file_load_all(UNUSED u8 reload) {
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index 844645c..e119fea 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -8,6 +8,8 @@
+ #define GFX_AR_TAG_MAGIC 0x41520000u
+ #define GFX_AR_TAG(kind, arg) (GFX_AR_TAG_MAGIC | (((uint32_t)(kind) & 0xFFu) << 8) | ((uint32_t)(arg) & 0xFFu))
+ enum { GFX_AR_TAG_SPACE = 1, GFX_AR_TAG_GROUP_BEGIN = 2, GFX_AR_TAG_GROUP_END = 3, GFX_AR_TAG_FOCUS = 4, GFX_AR_TAG_ROLE = 5 };
++/* ROOM tag argument: the room (1..255) of a room-switched area the following draws belong to, 0 = none. */
++enum { GFX_AR_TAG_ROOM = 6 };
+ /* ROLE tag argument: what the following display lists are (lighting). */
+ enum { GFX_AR_ROLE_TERRAIN = 0, GFX_AR_ROLE_OBJECT = 1, GFX_AR_ROLE_SHADOW = 2, GFX_AR_ROLE_EFFECT = 3 };
+ enum { GFX_AR_ROLE_WATER = 5, GFX_AR_ROLE_LAVA = 6 };
+@@ -30,6 +32,7 @@ struct GfxArHooks {
+     void (*focus)(int owner);           /* FOCUS tag: 0, or player index + 1 (x-ray silhouette owner), after a flush */
+     void (*role)(int role);             /* ROLE tag: GFX_AR_ROLE_*, after a flush */
+     void (*material)(int flags);        /* GFX_AR_MAT_* of the next WORLD triangles, after a flush; reset each frame */
++    void (*room)(int room);             /* ROOM tag: the room of the following draws (0 = none), after a flush */
+ };
+ extern struct GfxArHooks *gGfxArHooks;   /* NULL = upstream behaviour */
+ extern bool gArMode;
+diff --git a/src/pc/gfx/gfx_pc.c b/src/pc/gfx/gfx_pc.c
+index 3228f26..6d2d028 100644
+--- a/src/pc/gfx/gfx_pc.c
++++ b/src/pc/gfx/gfx_pc.c
+@@ -1907,6 +1907,8 @@ static void gfx_ar_noop(uintptr_t w1) {
+     } else if (kind == GFX_AR_TAG_ROLE) {
+         sArRole = (int)arg; sArLavaTex = false;
+         if (gGfxArHooks->role) { gGfxArHooks->role((int)arg); }
++    } else if (kind == GFX_AR_TAG_ROOM) {
++        if (gGfxArHooks->room) { gGfxArHooks->room((int)arg); }
+     }
+ }
+ 

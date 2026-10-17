@@ -1,0 +1,296 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Draw roles and light view
+
+ROLE tags tell the renderer what a draw is, so it can light it and decide
+what casts and receives shadows: terrain, object, shadow, effect, water and
+lava. The game emits them with gArMode; gfx_pc reports them through the hook
+table, together with each WORLD triangle's material flags (lit, texgen).
+
+- weather and particle lists (snow, underwater specks, flowers, lava
+  bubbles) are EFFECT: lit, but neither cast nor occlude, so their changing
+  count does not alter the static scene;
+- water boxes and the water/lava movtex quads are WATER and LAVA; Bowser in
+  the Fire Sea's arena draws its lava sea inside a static list, so terrain
+  draws that load that texture are LAVA too. The texture state starts afresh
+  every frame;
+- the host can set a light view, the rotation used for lights (not texgen)
+  of WORLD draws, overriding the lighting camera.
+
+Tags and lighting only: what the game draws and does is unchanged.
+---
+ src/engine/graph_node.h         |  1 +
+ src/game/rendering_graph_node.c | 44 ++++++++++++++++++++++++++++++
+ src/pc/gfx/gfx_ar_hooks.h       | 17 +++++++++++-
+ src/pc/gfx/gfx_pc.c             | 48 +++++++++++++++++++++++++++------
+ 4 files changed, 101 insertions(+), 9 deletions(-)
+
+diff --git a/src/engine/graph_node.h b/src/engine/graph_node.h
+index b04e6f7..9c77f22 100644
+--- a/src/engine/graph_node.h
++++ b/src/engine/graph_node.h
+@@ -135,6 +135,7 @@ struct DisplayListNode
+     struct DisplayListNode *next;
+     u8 usingCamSpace;
+     u8 arFocus;   /* AR: 0, or player index + 1 when the list is that player's own geometry (silhouette) */
++    u8 arRole;    /* AR: GFX_AR_ROLE_* (terrain, object, blob shadow) for lighting */
+ };
+ 
+ /** GraphNode that manages the 8 top-level display lists that will be drawn
+diff --git a/src/game/rendering_graph_node.c b/src/game/rendering_graph_node.c
+index a6a679c..a10e9a9 100644
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -24,6 +24,8 @@
+ #include "hardcoded.h"
+ #include "pc/gfx/gfx_ar_hooks.h"
+ #include "ar_game_hooks.h"
++#include "level_geo.h"
++#include "moving_texture.h"
+ 
+ /**
+  * This file contains the code that processes the scene graph for rendering.
+@@ -249,6 +251,35 @@ static struct GrowingArray* sMtxTbl = NULL;
+ struct Object* gCurGraphNodeProcessingObject = NULL;
+ struct MarioState* gCurGraphNodeMarioState = NULL;
+ static s32 sArNoFocus = FALSE;   /* AR: set while a player's blob shadow is appended (not part of the silhouette) */
++static s32 sArEffect = FALSE;   /* AR: set while an environment effect list (geo_envfx_main) is appended */
++/* AR: Bowser in the Fire Sea's arena: its lava sea's texture (gfx_ar_hooks.h gArLavaTexture) */
++extern ALIGNED8 Texture bowser_2_seg7_texture_07000000[];
++const void *gArLavaTexture = bowser_2_seg7_texture_07000000;
++static s32 sArLiquid = 0;   /* AR: GFX_AR_ROLE_WATER or _LAVA while a liquid list is appended, else 0 */
++/* AR: the liquid a generated list draws. Water: the water boxes' quads (not the three mists) and the water movtex
++ * quads (waterfalls, CotMC's stream); lava: LLL's and BitFS's lava movtex quads. The same parameter can mean another
++ * quad set for another geo function (moving_texture.h), so each function has its own list. */
++static s32 ar_liquid_role(const struct GraphNodeGenerated *node) {
++    const GraphNodeFunc f = node->fnNode.func;
++    const u32 p = node->parameter;
++    if (f == geo_movtex_draw_water_regions || f == geo_movtex_draw_water_regions_ext) {
++        if (p == HMC_MOVTEX_TOXIC_MAZE_MIST || p == SSL_MOVTEX_TOXBOX_QUICKSAND_MIST || p == JRB_MOVTEX_INTIAL_MIST) { return 0; }
++        return p == LLL_MOVTEX_VOLCANO_FLOOR_LAVA ? GFX_AR_ROLE_LAVA : GFX_AR_ROLE_WATER;
++    }
++    if (f == geo_movtex_draw_nocolor || f == geo_movtex_draw_colored || f == geo_movtex_draw_colored_no_update ||
++        f == geo_movtex_draw_colored_2_no_update) {
++        switch (p) {
++            case MOVTEX_LLL_LAVA_FLOOR: case MOVTEX_VOLCANO_LAVA_FALL:
++            case MOVTEX_BITFS_LAVA_FIRST: case MOVTEX_BITFS_LAVA_SECOND: case MOVTEX_BITFS_LAVA_FLOOR:
++                return GFX_AR_ROLE_LAVA;
++            case MOVTEX_CASTLE_WATERFALL: case MOVTEX_COTMC_WATER: case MOVTEX_TTM_BEGIN_WATERFALL: case MOVTEX_TTM_END_WATERFALL:
++            case MOVTEX_TTM_BEGIN_PUDDLE_WATERFALL: case MOVTEX_TTM_END_PUDDLE_WATERFALL: case MOVTEX_TTM_PUDDLE_WATERFALL:
++                return GFX_AR_ROLE_WATER;
++            default: break;
++        }
++    }
++    return 0;
++}
+ /* AR: player i's own geometry is tagged for the x-ray silhouette; held objects and the shadow are not. */
+ static u8 ar_focus_owner(void) {
+     if (!gArMode || sArNoFocus || gCurGraphNodeHeldObject != NULL) { return 0; }
+@@ -552,6 +583,7 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+     struct RenderModeContainer *mode2List = &renderModeTable_2Cycle[enableZBuffer];
+     s32 arSpace = -1;
+     s32 arFocus = 0;
++    s32 arRole = -1;
+ 
+     // @bug This is where the LookAt values should be calculated but aren't.
+     // As a result, environment mapping is broken on Fast3DEX2 without the
+@@ -581,6 +613,10 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+                     gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_FOCUS, currList->arFocus));
+                     arFocus = currList->arFocus;
+                 }
++                if (gArMode && currList->arRole != arRole) {
++                    gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(GFX_AR_TAG_ROLE, currList->arRole));
++                    arRole = currList->arRole;
++                }
+                 detect_and_skip_mtx_interpolation(&currList->transform, &currList->transformPrev);
+ 
+                 struct MtxInterp *interp = growing_array_alloc(sMtxTbl, sizeof(struct MtxInterp));
+@@ -630,6 +666,9 @@ static void geo_append_display_list(void *displayList, s16 layer) {
+         listNode->next = 0;
+         listNode->usingCamSpace = sUsingCamSpace;
+         listNode->arFocus = ar_focus_owner();
++        /* sArNoFocus is set exactly while a blob shadow list is appended (geo_process_shadow) */
++        listNode->arRole = sArNoFocus ? GFX_AR_ROLE_SHADOW : sArEffect ? GFX_AR_ROLE_EFFECT : sArLiquid ? (u8) sArLiquid
++                         : (gCurGraphNodeObject != NULL ? GFX_AR_ROLE_OBJECT : GFX_AR_ROLE_TERRAIN);
+         if (gCurGraphNodeMasterList->listHeads[layer] == 0) {
+             gCurGraphNodeMasterList->listHeads[layer] = listNode;
+         } else {
+@@ -1098,7 +1137,12 @@ static void geo_process_generated_list(struct GraphNodeGenerated *node) {
+         Gfx *list = node->fnNode.func(GEO_CONTEXT_RENDER, &node->fnNode.node, gMatStack[gMatStackIndex]);
+ 
+         if (list != NULL) {
++            /* AR: the weather particles (snow, underwater specks, flowers, lava bubbles) are effects, not terrain */
++            sArEffect = node->fnNode.func == geo_envfx_main;
++            sArLiquid = gArMode ? ar_liquid_role(node) : 0;   /* AR: a tag only: the list and its draws are vanilla's */
+             geo_append_display_list((void *) VIRTUAL_TO_PHYSICAL(list), node->fnNode.node.flags >> 8);
++            sArEffect = FALSE;
++            sArLiquid = 0;
+         }
+     }
+     if (node->fnNode.node.children != NULL) {
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index 76b68c6..30bec45 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -7,7 +7,17 @@
+ /* G_NOOP tag word: "AR" in the high 16 bits, kind in bits 8..15, argument in bits 0..7. */
+ #define GFX_AR_TAG_MAGIC 0x41520000u
+ #define GFX_AR_TAG(kind, arg) (GFX_AR_TAG_MAGIC | (((uint32_t)(kind) & 0xFFu) << 8) | ((uint32_t)(arg) & 0xFFu))
+-enum { GFX_AR_TAG_SPACE = 1, GFX_AR_TAG_GROUP_BEGIN = 2, GFX_AR_TAG_GROUP_END = 3, GFX_AR_TAG_FOCUS = 4 };
++enum { GFX_AR_TAG_SPACE = 1, GFX_AR_TAG_GROUP_BEGIN = 2, GFX_AR_TAG_GROUP_END = 3, GFX_AR_TAG_FOCUS = 4, GFX_AR_TAG_ROLE = 5 };
++/* ROLE tag argument: what the following display lists are (lighting). */
++enum { GFX_AR_ROLE_TERRAIN = 0, GFX_AR_ROLE_OBJECT = 1, GFX_AR_ROLE_SHADOW = 2, GFX_AR_ROLE_EFFECT = 3 };
++enum { GFX_AR_ROLE_WATER = 5, GFX_AR_ROLE_LAVA = 6 };
++/* with gArMode, TERRAIN draws that load this texture image are drawn with the LAVA role, until the next texture image
++ * or ROLE tag: Bowser in the Fire Sea's arena draws its lava sea inside a static list (not a movtex), next to its spike
++ * posts, and the game keeps the lists as heap copies, so the texture is what names the sea. Defined by the game
++ * (rendering_graph_node.c); NULL = none. */
++extern const void *gArLavaTexture;
++/* material() flags of WORLD triangles: the geometry mode they were lit with. */
++enum { GFX_AR_MAT_LIT = 1, GFX_AR_MAT_TEXGEN = 2 };
+ enum { GFX_AR_SPACE_SCREEN = 0, GFX_AR_SPACE_WORLD = 1, GFX_AR_SPACE_DISCARD = 2 };
+ enum { GFX_AR_CULL_NONE = 0, GFX_AR_CULL_BACK = 1, GFX_AR_CULL_FRONT = 2 };
+ enum { GFX_AR_GROUP_MISC = 1, GFX_AR_GROUP_COUNTERS = 2, GFX_AR_GROUP_POWER_METER = 3,
+@@ -18,6 +28,8 @@ struct GfxArHooks {
+     void (*set_cull)(int cull);         /* GFX_AR_CULL_*, WORLD only, after a flush */
+     void (*group)(int begin, int id);   /* overlay group BEGIN (1) / END (0), after a flush */
+     void (*focus)(int owner);           /* FOCUS tag: 0, or player index + 1 (x-ray silhouette owner), after a flush */
++    void (*role)(int role);             /* ROLE tag: GFX_AR_ROLE_*, after a flush */
++    void (*material)(int flags);        /* GFX_AR_MAT_* of the next WORLD triangles, after a flush; reset each frame */
+ };
+ extern struct GfxArHooks *gGfxArHooks;   /* NULL = upstream behaviour */
+ extern bool gArMode;
+@@ -30,4 +42,7 @@ extern bool gArCannonVisible;
+ /* Lighting camera: rotation used for lights and texgen of WORLD draws. */
+ void gfx_ar_set_shading_view(const float m[4][4]);
+ void gfx_ar_clear_shading_view(void);
++/* Light view: the rotation used for the lights (not texgen) of WORLD draws; overrides the shading view for lights. */
++void gfx_ar_set_light_view(const float m[4][4]);
++void gfx_ar_clear_light_view(void);
+ #endif
+diff --git a/src/pc/gfx/gfx_pc.c b/src/pc/gfx/gfx_pc.c
+index 799ab29..6b6f514 100644
+--- a/src/pc/gfx/gfx_pc.c
++++ b/src/pc/gfx/gfx_pc.c
+@@ -132,6 +132,11 @@ static Mat4 sArShadingView;
+ static bool sArHasShadingView = false;
+ void gfx_ar_set_shading_view(const float m[4][4]) { memcpy(sArShadingView, m, sizeof(sArShadingView)); sArHasShadingView = true; }
+ void gfx_ar_clear_shading_view(void) { sArHasShadingView = false; }
++static int sArMat = -1;
++static Mat4 sArLightView;
++static bool sArHasLightView = false;
++void gfx_ar_set_light_view(const float m[4][4]) { memcpy(sArLightView, m, sizeof(sArLightView)); sArHasLightView = true; rsp.lights_changed = true; }
++void gfx_ar_clear_light_view(void) { sArHasLightView = false; rsp.lights_changed = true; }
+ 
+ Vec3f gLightingDir = { 0.0f, 0.0f, 0.0f };
+ Color gLightingColor[2] = { { 0xFF, 0xFF, 0xFF }, { 0xFF, 0xFF, 0xFF } };
+@@ -652,7 +657,7 @@ static void OPTIMIZE_O3 gfx_transposed_matrix_mul(VEC_OUT Vec3f res, const Vec3f
+     res[2] = a[0] * b[2][0] + a[1] * b[2][1] + a[2] * b[2][2];
+ }
+ 
+-static void calculate_normal_dir(const Light_t *light, Vec3f coeffs, bool applyLightingDir) {
++static void calculate_normal_dir(const Light_t *light, Vec3f coeffs, bool applyLightingDir, bool arLight) {
+     float light_dir[3] = {
+         light->dir[0] / 127.0f,
+         light->dir[1] / 127.0f,
+@@ -665,9 +670,10 @@ static void calculate_normal_dir(const Light_t *light, Vec3f coeffs, bool applyL
+         light_dir[2] += gLightingDir[2];
+     }
+ 
+-    if (gfx_ar_world() && sArHasShadingView) {
+-        Mat4 mvs;
+-        mtxf_mul(mvs, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], sArShadingView);
++    const bool arLightView = arLight && sArHasLightView;
++    if (gfx_ar_world() && (arLightView || sArHasShadingView)) {
++        Mat4 mvs;   /* eye-space directions: model, then the light view (lights) or the lighting camera (lights, texgen) */
++        mtxf_mul(mvs, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], arLightView ? sArLightView : sArShadingView);
+         gfx_transposed_matrix_mul(coeffs, light_dir, mvs);
+     } else {
+         gfx_transposed_matrix_mul(coeffs, light_dir, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
+@@ -850,12 +856,12 @@ static void OPTIMIZE_O3 gfx_sp_vertex(size_t n_vertices, size_t dest_index, cons
+             if (rsp.lights_changed) {
+                 bool applyLightingDir = !(rsp.geometry_mode & G_TEXTURE_GEN);
+                 for (int32_t i = 0; i < rsp.current_num_lights - 1; i++) {
+-                    calculate_normal_dir(&rsp.current_lights[i], rsp.current_lights_coeffs[i], applyLightingDir);
++                    calculate_normal_dir(&rsp.current_lights[i], rsp.current_lights_coeffs[i], applyLightingDir, true);
+                 }
+                 static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};
+                 static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
+-                calculate_normal_dir(&lookat_x, rsp.current_lookat_coeffs[0], applyLightingDir);
+-                calculate_normal_dir(&lookat_y, rsp.current_lookat_coeffs[1], applyLightingDir);
++                calculate_normal_dir(&lookat_x, rsp.current_lookat_coeffs[0], applyLightingDir, false);
++                calculate_normal_dir(&lookat_y, rsp.current_lookat_coeffs[1], applyLightingDir, false);
+                 rsp.lights_changed = false;
+             }
+ 
+@@ -1105,6 +1111,15 @@ static void gfx_ar_report_cull(void) {
+     }
+ }
+ 
++static void gfx_ar_report_material(void) {
++    int mat = ((rsp.geometry_mode & G_LIGHTING) ? GFX_AR_MAT_LIT : 0) | ((rsp.geometry_mode & G_TEXTURE_GEN) ? GFX_AR_MAT_TEXGEN : 0);
++    if (mat != sArMat) {
++        gfx_flush();
++        sArMat = mat;
++        if (gGfxArHooks->material) { gGfxArHooks->material(mat); }
++    }
++}
++
+ static void OPTIMIZE_O3 gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
+     struct GfxVertex *v1 = &rsp.loaded_vertices[vtx1_idx];
+     struct GfxVertex *v2 = &rsp.loaded_vertices[vtx2_idx];
+@@ -1117,7 +1132,7 @@ static void OPTIMIZE_O3 gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t
+     }
+ 
+     if (gfx_ar_world()) {
+-        gfx_ar_report_cull();
++        gfx_ar_report_cull(); gfx_ar_report_material();
+     } else if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
+         float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
+         float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
+@@ -1855,6 +1870,9 @@ static inline void *seg_addr(uintptr_t w1) {
+ #define C0(pos, width) ((cmd->words.w0 >> (pos)) & ((1U << width) - 1))
+ #define C1(pos, width) ((cmd->words.w1 >> (pos)) & ((1U << width) - 1))
+ 
++static int sArRole = GFX_AR_ROLE_TERRAIN;
++static bool sArLavaTex = false;
++
+ static void gfx_ar_noop(uintptr_t w1) {
+     if (gGfxArHooks == NULL || (w1 >> 16) != (GFX_AR_TAG_MAGIC >> 16)) { return; }
+     uint32_t kind = (uint32_t)(w1 >> 8) & 0xFFu, arg = (uint32_t)w1 & 0xFFu;
+@@ -1868,6 +1886,9 @@ static void gfx_ar_noop(uintptr_t w1) {
+         if (gGfxArHooks->group) { gGfxArHooks->group(kind == GFX_AR_TAG_GROUP_BEGIN, (int)arg); }
+     } else if (kind == GFX_AR_TAG_FOCUS) {
+         if (gGfxArHooks->focus) { gGfxArHooks->focus((int)arg); }
++    } else if (kind == GFX_AR_TAG_ROLE) {
++        sArRole = (int)arg; sArLavaTex = false;
++        if (gGfxArHooks->role) { gGfxArHooks->role((int)arg); }
+     }
+ }
+ 
+@@ -1986,6 +2007,15 @@ static void OPTIMIZE_O3 gfx_run_dl(Gfx* cmd) {
+ 
+             // RDP Commands:
+             case G_SETTIMG:
++                if (gArMode && gArLavaTexture != NULL && gGfxArHooks != NULL && gGfxArHooks->role != NULL) {
++                    /* AR: a tag only: the draws are vanilla's */
++                    const bool lava = seg_addr(cmd->words.w1) == gArLavaTexture && sArRole == GFX_AR_ROLE_TERRAIN;
++                    if (lava != sArLavaTex) {
++                        gfx_flush();
++                        sArLavaTex = lava;
++                        gGfxArHooks->role(lava ? GFX_AR_ROLE_LAVA : sArRole);
++                    }
++                }
+                 gfx_dp_set_texture_image(C0(21, 3), C0(19, 2), C0(0, 10), seg_addr(cmd->words.w1));
+                 break;
+             case G_LOADBLOCK:
+@@ -2168,6 +2198,8 @@ void gfx_start_frame(void) {
+ 
+ void gfx_run(Gfx *commands) {
+     sArSpace = GFX_AR_SPACE_SCREEN;
++    sArMat = -1;
++    sArRole = GFX_AR_ROLE_TERRAIN; sArLavaTex = false;   /* AR: no ROLE tag or lava texture carries into a frame */
+     gfx_sp_reset();
+ 
+     sHasInverseCameraMatrix = false;

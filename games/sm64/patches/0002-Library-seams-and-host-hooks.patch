@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Library seams and host hooks
+
+Lets a host embed the game as a library and drive it tick by tick.
+
+- pc_main: sm64coop_boot runs everything up to the main loop (returns 0 when
+  no valid ROM is found) and sm64coop_tick performs exactly one 30 Hz step:
+  network, game, Lua, audio and one render, with no interpolation or sleep.
+  With SM64_AR_LIBRARY the desktop main() and the SDL/GL backend selection
+  are left out, so the dummy window/render APIs and audio_null stay in use.
+- network: a host can run as server without binding a socket (single
+  player, no UDP), and in library mode the area timer advances once per
+  unpaused tick instead of following the wall clock, so replays are
+  deterministic.
+- controller: an injection hook supplies the pad state each tick; while it
+  is set the physical pads are ignored.
+- an accessor for the file-static RNG seed (determinism checks) and an
+  override for the resource path.
+
+The desktop build behaves as before.
+---
+ src/engine/behavior_script.c               |  2 ++
+ src/pc/controller/controller_entry_point.c |  4 +++
+ src/pc/network/network.c                   |  8 ++++++
+ src/pc/pc_main.c                           | 30 +++++++++++++++++++---
+ src/pc/platform.c                          |  3 +++
+ src/pc/platform.h                          |  3 +++
+ 6 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/src/engine/behavior_script.c b/src/engine/behavior_script.c
+index 00daaec..8db4248 100644
+--- a/src/engine/behavior_script.c
++++ b/src/engine/behavior_script.c
+@@ -39,6 +39,8 @@
+ 
+ static u16 gRandomSeed16;
+ 
++u16 ar_get_random_seed(void) { return gRandomSeed16; }
++
+ // Unused function that directly jumps to a behavior command and resets the object's stack index.
+ UNUSED static void goto_behavior_unused(const BehaviorScript *bhvAddr) {
+     gCurBhvCommand = segmented_to_virtual(bhvAddr);
+diff --git a/src/pc/controller/controller_entry_point.c b/src/pc/controller/controller_entry_point.c
+index d7924f5..0eda725 100644
+--- a/src/pc/controller/controller_entry_point.c
++++ b/src/pc/controller/controller_entry_point.c
+@@ -17,6 +17,8 @@ static struct ControllerAPI *controller_implementations[] = {
+     &controller_keyboard,
+ };
+ 
++struct ControllerAPI *gControllerInjection = NULL;
++
+ s32 osContInit(UNUSED OSMesgQueue *mq, u8 *controllerBits, UNUSED OSContStatus *status) {
+     for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++)
+         controller_implementations[i]->init();
+@@ -53,6 +55,8 @@ void osContGetReadData(OSContPad *pad) {
+     pad->ext_stick_x = 0;
+     pad->ext_stick_y = 0;
+     pad->errnum = 0;
++    // an injected controller is exclusive: no physical pad or keyboard input leaks in
++    if (gControllerInjection) { gControllerInjection->read(pad); return; }
+ 
+     for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++) {
+         controller_implementations[i]->read(pad);
+diff --git a/src/pc/network/network.c b/src/pc/network/network.c
+index dad3671..5f23bcd 100644
+--- a/src/pc/network/network.c
++++ b/src/pc/network/network.c
+@@ -96,8 +96,11 @@ struct NametagsSettings gNametagsSettings = {
+     .showSelfTag = false,
+ };
+ 
++struct NetworkSystem *gNetworkSystemOverride = NULL;
++
+ void network_set_system(enum NetworkSystemType nsType) {
+     network_forget_all_reliable();
++    if (gNetworkSystemOverride) { gNetworkSystem = gNetworkSystemOverride; return; }
+ 
+     switch (nsType) {
+         case NS_SOCKET:  gNetworkSystem = &gNetworkSystemSocket; break;
+@@ -517,6 +520,10 @@ static void network_rehost_update(void) {
+ }
+ 
+ static void network_update_area_timer(void) {
++#ifdef SM64_AR_LIBRARY
++    // the embedding host paces ticks: advance exactly once per unpaused tick, never from the wall clock
++    if (!network_check_singleplayer_pause()) { gNetworkAreaTimer++; }
++#else
+     bool brokenClock = false;
+ #ifdef DEVELOPMENT
+     static u16 skipClockCount = 0;
+@@ -549,6 +556,7 @@ static void network_update_area_timer(void) {
+             gNetworkAreaTimer--;
+         }
+     }
++#endif
+ }
+ 
+ #ifdef COOPNET
+diff --git a/src/pc/pc_main.c b/src/pc/pc_main.c
+index 0d4f9f7..36dc6cf 100644
+--- a/src/pc/pc_main.c
++++ b/src/pc/pc_main.c
+@@ -221,6 +221,7 @@ static void select_graphics_backend(void) {
+         return;
+     }
+ 
++#ifndef SM64_AR_LIBRARY
+ #if defined(_WIN32)
+     if (configGraphicsBackend == GAPI_GL && !gfx_sdl_check_opengl_compatibility()) {
+         configGraphicsBackend = GAPI_D3D11;
+@@ -254,6 +255,7 @@ static void select_graphics_backend(void) {
+     if (!gAudioApi->init()) {
+         gAudioApi = &audio_null;
+     }
++#endif
+ }
+ 
+ void produce_interpolation_frames_and_delay(void) {
+@@ -500,7 +502,7 @@ void* main_game_init(UNUSED void* dummy) {
+     return NULL;
+ }
+ 
+-int main(int argc, char *argv[]) {
++int sm64coop_boot(int argc, char *argv[]) {
+     // handle terminal arguments
+     if (!parse_cli_opts(argc, argv)) { return 0; }
+ 
+@@ -610,7 +612,28 @@ int main(int argc, char *argv[]) {
+         network_init(NT_NONE, false);
+     }
+ 
+-    // main loop
++    return 1;
++}
++
++void sm64coop_tick(void) {
++    network_update();
++    patch_interpolations_before();
++    game_loop_one_iteration();
++    smlua_update();
++    if (gAudioThread.state == INVALID) { buffer_audio(); }
++    // exactly one render per tick, no interpolation, no delay
++    gRenderingInterpolated = false;
++    gRenderingDelta = 1.0f;
++    gfx_start_frame();
++    patch_interpolations(1.0f);
++    send_display_list(gGfxSPTask);
++    gfx_end_frame_render();
++    gfx_display_frame();
++}
++
++#ifndef SM64_AR_LIBRARY
++int main(int argc, char *argv[]) {
++    if (!sm64coop_boot(argc, argv)) { return 0; }
+     while (true) {
+         debug_context_reset();
+         CTX_BEGIN(CTX_TOTAL);
+@@ -624,12 +647,11 @@ int main(int argc, char *argv[]) {
+         fflush(stderr);
+ #endif
+         CTX_END(CTX_TOTAL);
+-
+ #ifdef DEVELOPMENT
+         djui_ctx_display_update();
+ #endif
+         djui_lua_profiler_update();
+     }
+-
+     return 0;
+ }
++#endif
+diff --git a/src/pc/platform.c b/src/pc/platform.c
+index 2eba403..f1fb641 100644
+--- a/src/pc/platform.c
++++ b/src/pc/platform.c
+@@ -329,8 +329,11 @@ const char *sys_user_path(void) {
+     return path;
+ }
+ 
++const char *gArResourcePathOverride = NULL;
++
+ const char *sys_resource_path(void)
+ {
++    if (gArResourcePathOverride) { return gArResourcePathOverride; }
+ #ifdef __APPLE__ // Kinda lazy, but I don't know how to add CoreFoundation.framework
+     static char path[SYS_MAX_PATH];
+     if ('\0' != path[0]) { return path; }
+diff --git a/src/pc/platform.h b/src/pc/platform.h
+index e043c6a..e16ebf5 100644
+--- a/src/pc/platform.h
++++ b/src/pc/platform.h
+@@ -29,6 +29,9 @@ bool sys_windows_short_path_from_mbs(char* destPath, size_t destSize, const char
+ #endif
+ const char *sys_user_path(void);
+ const char *sys_resource_path(void);
++/* AR (0002-Library-seams-and-host-hooks.patch): when set, sys_resource_path() returns this directory (lang/, mods/, dynos/, palettes/). A visionOS
++ * app bundle is flat, with no ../Resources next to the executable. NULL keeps the upstream lookup. */
++extern const char *gArResourcePathOverride;
+ const char *sys_exe_path_dir(void);
+ const char *sys_exe_path_file(void);
+ const char *sys_file_extension(const char *fpath);

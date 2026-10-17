@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleExecutable</key><string>SM64AR</string>
+  <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>SM64AR</string>
+  <key>CFBundleDisplayName</key><string>Diorama64</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.5</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>MinimumOSVersion</key><string>26.0</string>
+  <key>UIApplicationSceneManifest</key>
+  <dict>
+    <!-- Without this, openImmersiveSpace fails before the layer configuration is even asked for (ref port). -->
+    <key>UIApplicationSupportsMultipleScenes</key><true/>
+    <key>UIApplicationPreferredDefaultSceneSessionRole</key><string>UIWindowSceneSessionRoleApplication</string>
+    <key>UISceneConfigurations</key><dict/>
+  </dict>
+  <key>NSWorldSensingUsageDescription</key><string>Finds a table to put the level on.</string>
+  <key>NSHandsTrackingUsageDescription</key><string>Lets Mario's eyes follow your fingertip on the title screen.</string>
+  <key>GCSupportsControllerUserInteraction</key><true/>
+  <key>GCSupportedGameControllers</key>
+  <array><dict><key>ProfileName</key><string>ExtendedGamepad</string></dict></array>
+</dict>
+</plist>

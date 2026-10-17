@@ -1,0 +1,387 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Viewer-relative camera, controls and listener
+
+In AR the viewer's head is the camera, so the game's own camera output is
+replaced where it matters. All of it requires gArMode.
+
+- the camera node uses an identity view and no screen roll, and object
+  frustum culling is skipped: the whole diorama is in view. Lakitu still
+  runs; only its view output is discarded.
+- adds the game hook table (src/game/ar_game_hooks.h, gArGameHooks, NULL by
+  default). The stick, pole and star-dance facing use its control_yaw, so
+  the stick is relative to the viewer; billboards and cylboards face the
+  head; every positional sound's source vector is taken in the head's
+  listener space.
+- the object draw distance is infinite, the far plane is raised and the
+  depth cull is skipped, without touching the user's saved configDrawDistance.
+- the cannon Mario aims from stays drawn and its barrel follows the aim
+  (gArCannonVisible, default on; off is vanilla).
+---
+ src/engine/behavior_script.c       |  3 ++
+ src/game/ar_game_hooks.h           | 20 ++++++++++
+ src/game/behaviors/cannon.inc.c    | 15 ++++++-
+ src/game/mario.c                   |  8 +++-
+ src/game/mario_actions_automatic.c |  3 +-
+ src/game/mario_actions_cutscene.c  |  5 ++-
+ src/game/rendering_graph_node.c    | 64 ++++++++++++++++++++++--------
+ src/pc/gfx/gfx_ar_hooks.h          |  3 ++
+ 8 files changed, 98 insertions(+), 23 deletions(-)
+
+diff --git a/src/engine/behavior_script.c b/src/engine/behavior_script.c
+index 8db4248..2f021ab 100644
+--- a/src/engine/behavior_script.c
++++ b/src/engine/behavior_script.c
+@@ -22,6 +22,7 @@
+ #include "game/rng_position.h"
+ #include "game/interaction.h"
+ #include "game/hardcoded.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ // Macros for retrieving arguments from behavior scripts.
+ #define BHV_CMD_GET_1ST_U8(index)  (u8)((gCurBhvCommand[index] >> 24) & 0xFF) // unused
+@@ -1487,6 +1488,7 @@ f32 position_based_random_float_position(void) {
+ }
+ 
+ bool draw_distance_scalar_is_infinite(void) {
++    if (gArMode) { return true; }   /* AR: the whole diorama is always in view; the saved setting stays */
+     if (!gBehaviorValues.InfiniteRenderDistance) {
+         return false;
+     }
+@@ -1494,6 +1496,7 @@ bool draw_distance_scalar_is_infinite(void) {
+ }
+ 
+ f32 draw_distance_scalar(void) {
++    if (gArMode) { return 999.0f; }
+     if (!gBehaviorValues.InfiniteRenderDistance) { return 1.0f; }
+ 
+     switch (configDrawDistance) {
+diff --git a/src/game/ar_game_hooks.h b/src/game/ar_game_hooks.h
+index e69de29..ee452a4 100644
+--- a/src/game/ar_game_hooks.h
++++ b/src/game/ar_game_hooks.h
+@@ -0,0 +1,20 @@
++#ifndef AR_GAME_HOOKS_H
++#define AR_GAME_HOOKS_H
++/* AR game-side seams. The table is NULL by default and every call site also requires
++ * gArMode, so with gArMode == false the game behaves exactly like upstream. The host (AR adapter) fills it. */
++#include <PR/ultratypes.h>
++#include "pc/gfx/gfx_ar_hooks.h"
++struct MarioState;
++struct ArGameHooks {
++    /* Yaw in camera->yaw convention (from Mario toward the viewer) for the stick, pole and star-dance facing. */
++    s16 (*control_yaw)(struct MarioState *m);
++    /* Billboard (cylinder == 0) or cylboard matrix facing the viewer's head; replaces mtxf_billboard/mtxf_cylboard. */
++    void (*billboard)(f32 dest[4][4], f32 mtx[4][4], f32 position[3], s32 cylinder);
++    /* Listener-space vector of a level-space point (the head is the listener); replaces cameraToObject = view * pos.
++     * levelPos is gMatStack[gMatStackIndex][3], which is level space only because ar_camera_lookat
++     * (rendering_graph_node.c) makes the view the identity in AR mode; if that changes, pass a level-space point. */
++    void (*listener_vector)(f32 out[3], f32 levelPos[3]);
++};
++extern struct ArGameHooks *gArGameHooks;
++#define AR_GAME_HOOK(name) (gArMode && gArGameHooks != NULL && gArGameHooks->name != NULL)
++#endif
+diff --git a/src/game/behaviors/cannon.inc.c b/src/game/behaviors/cannon.inc.c
+index 9450aac..7c29d66 100644
+--- a/src/game/behaviors/cannon.inc.c
++++ b/src/game/behaviors/cannon.inc.c
+@@ -1,4 +1,6 @@
+ // cannon.c.inc
++#include "pc/gfx/gfx_ar_hooks.h"
++bool gArCannonVisible = true;   /* gfx_ar_hooks.h; set by the AR adapter at each tick start */
+ 
+ void bhv_cannon_base_unused_loop(void) {
+     o->oPosY += o->oVelY;
+@@ -107,12 +109,21 @@ void opened_cannon_act_5(void) {
+ 
+ void opened_cannon_act_1(void) {
+     UNUSED s32 unused;
+-    if (o->oCannonPlayerIndex == 0) {
++    if (o->oCannonPlayerIndex == 0 && !(gArMode && gArCannonVisible)) {   /* vanilla: the camera sits inside the barrel */
+         cur_obj_become_intangible();
+         cur_obj_disable_rendering();
+     } else if (o->oCannonPlayerIndex >= 0 && o->oCannonPlayerIndex < MAX_PLAYERS) {
+         struct MarioState* controlledBy = &gMarioStates[o->oCannonPlayerIndex];
+-        o->oMoveAnglePitch = 14563 + controlledBy->faceAngle[0] * -0.5f;
++        if (o->oCannonPlayerIndex == 0) {
++            /* AR: the camera is the player's head outside the cannon. It stays drawn and its barrel (model +Y, tilted
++             * toward +Z by the pitch) follows the aim: elevation 90 deg - pitch, so pitch = 0x4000 - Mario's pitch. Nothing
++             * reads the base's angles during act 1 (Mario copied them in act_in_cannon state 1, the tick before). */
++            cur_obj_become_intangible();
++            cur_obj_enable_rendering();
++            o->oMoveAnglePitch = 0x4000 - controlledBy->faceAngle[0];
++        } else {
++            o->oMoveAnglePitch = 14563 + controlledBy->faceAngle[0] * -0.5f;
++        }
+         if (controlledBy->marioObj != NULL) {
+             o->oMoveAngleYaw = controlledBy->marioObj->oMarioCannonObjectYaw + controlledBy->marioObj->oMarioCannonInputYaw;
+         }
+diff --git a/src/game/mario.c b/src/game/mario.c
+index 3e71353..d3c76a0 100644
+--- a/src/game/mario.c
++++ b/src/game/mario.c
+@@ -44,6 +44,9 @@
+ #include "pc/network/socket/socket.h"
+ #include "bettercamera.h"
+ #include "first_person_cam.h"
++#include "ar_game_hooks.h"
++
++struct ArGameHooks *gArGameHooks = NULL;
+ 
+ #define MAX_HANG_PREVENTION 64
+ 
+@@ -1522,7 +1525,10 @@ void update_mario_joystick_inputs(struct MarioState *m) {
+     if ((sCurrPlayMode == PLAY_MODE_PAUSED) || m->playerIndex != 0) { return; }
+ 
+     if (m->intendedMag > 0.0f) {
+-        if (gLakituState.mode != CAMERA_MODE_NEWCAM) {
++        if (AR_GAME_HOOK(control_yaw)) {
++            // AR: the stick is relative to the viewer's head, not to the hidden Lakitu
++            m->intendedYaw = atan2s(-controller->stickY, controller->stickX) + gArGameHooks->control_yaw(m);
++        } else if (gLakituState.mode != CAMERA_MODE_NEWCAM) {
+             m->intendedYaw = atan2s(-controller->stickY, controller->stickX) + m->area->camera->yaw;
+         } else if (get_first_person_enabled()) {
+             m->intendedYaw = atan2s(-controller->stickY, controller->stickX) + gLakituState.yaw;
+diff --git a/src/game/mario_actions_automatic.c b/src/game/mario_actions_automatic.c
+index 1a8bca3..ea8be50 100644
+--- a/src/game/mario_actions_automatic.c
++++ b/src/game/mario_actions_automatic.c
+@@ -24,6 +24,7 @@
+ #include "pc/configfile.h"
+ #include "pc/network/network.h"
+ #include "pc/lua/smlua.h"
++#include "ar_game_hooks.h"
+ 
+ #define POLE_NONE          0
+ #define POLE_TOUCHED_FLOOR 1
+@@ -225,7 +226,7 @@ s32 act_climbing_pole(struct MarioState *m) {
+     if (m->usedObj == NULL) { m->usedObj = cur_obj_find_nearest_pole(); }
+     s32 sp24;
+     struct Object *marioObj = m->marioObj;
+-    s16 cameraAngle = m->area->camera->yaw;
++    s16 cameraAngle = (AR_GAME_HOOK(control_yaw) && m->playerIndex == 0) ? gArGameHooks->control_yaw(m) : m->area->camera->yaw;
+ 
+ #ifndef VERSION_JP
+     if (m->health < 0x100) {
+diff --git a/src/game/mario_actions_cutscene.c b/src/game/mario_actions_cutscene.c
+index 89e46a1..9602e64 100644
+--- a/src/game/mario_actions_cutscene.c
++++ b/src/game/mario_actions_cutscene.c
+@@ -36,6 +36,7 @@
+ #include "pc/network/network.h"
+ #include "pc/lua/smlua.h"
+ #include "pc/lua/smlua_hooks.h"
++#include "ar_game_hooks.h"
+ 
+ // TODO: put this elsewhere
+ enum SaveOption { SAVE_OPT_SAVE_AND_CONTINUE = 1, /*SAVE_OPT_SAVE_AND_QUIT, SAVE_OPT_SAVE_EXIT_GAME,*/ SAVE_OPT_CONTINUE_DONT_SAVE };
+@@ -787,7 +788,7 @@ void general_star_dance_handler(struct MarioState *m, s32 isInWater) {
+ s32 act_star_dance(struct MarioState *m) {
+     if (!m) { return 0; }
+     if (m == &gMarioStates[0]) {
+-        m->faceAngle[1] = m->area->camera->yaw;
++        m->faceAngle[1] = AR_GAME_HOOK(control_yaw) ? gArGameHooks->control_yaw(m) : m->area->camera->yaw;
+     }
+     set_character_animation(m, m->actionState == 2 ? CHAR_ANIM_RETURN_FROM_STAR_DANCE : CHAR_ANIM_STAR_DANCE);
+     general_star_dance_handler(m, 0);
+@@ -801,7 +802,7 @@ s32 act_star_dance(struct MarioState *m) {
+ s32 act_star_dance_water(struct MarioState *m) {
+     if (!m) { return 0; }
+     if (m == &gMarioStates[0]) {
+-        m->faceAngle[1] = m->area->camera->yaw;
++        m->faceAngle[1] = AR_GAME_HOOK(control_yaw) ? gArGameHooks->control_yaw(m) : m->area->camera->yaw;
+     }
+     set_character_animation(m, m->actionState == 2 ? CHAR_ANIM_RETURN_FROM_WATER_STAR_DANCE : CHAR_ANIM_WATER_STAR_DANCE);
+     vec3f_copy(m->marioObj->header.gfx.pos, m->pos);
+diff --git a/src/game/rendering_graph_node.c b/src/game/rendering_graph_node.c
+index b2139b4..a6a679c 100644
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -23,6 +23,7 @@
+ #include "mario.h"
+ #include "hardcoded.h"
+ #include "pc/gfx/gfx_ar_hooks.h"
++#include "ar_game_hooks.h"
+ 
+ /**
+  * This file contains the code that processes the scene graph for rendering.
+@@ -288,6 +289,23 @@ static void reset_mtx(void) {
+     init_mtx();
+ }
+ 
++/* AR: the viewer is not Lakitu. World geometry is emitted in level space (identity view) while the
++ * camera node still runs, so cutscenes and camera-driven game logic behave as in the original. */
++static void ar_camera_lookat(Mat4 m, Vec3f pos, Vec3f focus, s16 roll) {
++    if (gArMode) { mtxf_identity(m); } else { mtxf_lookat(m, pos, focus, roll); }
++}
++
++/* AR: billboards face the viewer's head, not the hidden Lakitu's screen plane. */
++static void ar_billboard(Mat4 dest, Mat4 mtx, Vec3f pos, s16 roll, s32 cylinder) {
++    if (AR_GAME_HOOK(billboard)) {
++        gArGameHooks->billboard(dest, mtx, pos, cylinder);
++    } else if (cylinder) {
++        mtxf_cylboard(dest, mtx, pos, roll);
++    } else {
++        mtxf_billboard(dest, mtx, pos, roll);
++    }
++}
++
+ void patch_mtx_before(void) {
+     init_mtx();
+ 
+@@ -312,6 +330,12 @@ void patch_mtx_before(void) {
+     }
+ }
+ 
++/* Far plane raised to the maximum and no depth cull: the user's "infinite" setting, or AR (the whole diorama is always
++ * in view). The saved configDrawDistance itself is never changed. */
++bool draw_distance_far_plane_unbounded(void) {
++    return gArMode || configDrawDistance == 6;
++}
++
+ void patch_mtx_interpolated(f32 delta) {
+     if (sPerspectiveNode != NULL) {
+         if (gCamSkipInterp) {
+@@ -323,7 +347,7 @@ void patch_mtx_interpolated(f32 delta) {
+         f32 far = replace_value_if_not_zero(sPerspectiveNode->far, gOverrideFar);
+ 
+         // "infinite" draw distance
+-        if (gOverrideFar == 0 && configDrawDistance == 6) { far = max(far, MAX_FAR_PLANE_DIST); }
++        if (gOverrideFar == 0 && draw_distance_far_plane_unbounded()) { far = max(far, MAX_FAR_PLANE_DIST); }
+ 
+         guPerspective(sPerspectiveMtx, &perspNorm, fovInterpolated, sPerspectiveAspect, near, far, 1.0f);
+         gSPMatrix(sPerspectivePos, VIRTUAL_TO_PHYSICAL(sPerspectiveNode), G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
+@@ -391,7 +415,7 @@ void patch_mtx_interpolated(f32 delta) {
+         Vec3f posInterp, focusInterp;
+         delta_interpolate_vec3f(posInterp, sCameraNode->prevPos, sCameraNode->pos, delta);
+         delta_interpolate_vec3f(focusInterp, sCameraNode->prevFocus, sCameraNode->focus, delta);
+-        mtxf_lookat(camInterp.m, posInterp, focusInterp, sCameraNode->roll);
++        ar_camera_lookat(camInterp.m, posInterp, focusInterp, sCameraNode->roll);
+         mtxf_to_mtx(&camInterp, camInterp.m);
+     }
+ 
+@@ -687,7 +711,7 @@ static void geo_process_perspective(struct GraphNodePerspective *node) {
+     f32 far = replace_value_if_not_zero(node->far, gOverrideFar);
+ 
+     // "infinite" draw distance
+-    if (gOverrideFar == 0 && configDrawDistance == 6) { far = max(far, MAX_FAR_PLANE_DIST); }
++    if (gOverrideFar == 0 && draw_distance_far_plane_unbounded()) { far = max(far, MAX_FAR_PLANE_DIST); }
+ 
+     guPerspective(mtx, &perspNorm, node->prevFov, aspect, near, far, 1.0f);
+ 
+@@ -758,11 +782,11 @@ static void geo_process_camera(struct GraphNodeCamera *node) {
+     if (node->fnNode.func != NULL) {
+         node->fnNode.func(GEO_CONTEXT_RENDER, &node->fnNode.node, gMatStack[gMatStackIndex]);
+     }
+-    mtxf_rotate_xy(rollMtx->m, node->rollScreen);
++    mtxf_rotate_xy(rollMtx->m, gArMode ? 0 : node->rollScreen);
+ 
+     gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(rollMtx), G_MTX_PROJECTION | G_MTX_MUL | G_MTX_NOPUSH);
+ 
+-    mtxf_lookat(cameraTransform, node->pos, node->focus, node->roll);
++    ar_camera_lookat(cameraTransform, node->pos, node->focus, node->roll);
+     mtxf_mul(gMatStack[gMatStackIndex + 1], cameraTransform, gMatStack[gMatStackIndex]);
+ 
+     if (gCamSkipInterp) {
+@@ -778,10 +802,10 @@ static void geo_process_camera(struct GraphNodeCamera *node) {
+     vec3f_sub(gCamSkipInterpDisplacement, node->pos);
+ 
+     if (gGlobalTimer == node->prevTimestamp + 1 && gGlobalTimer != gLakituState.skipCameraInterpolationTimestamp) {
+-        mtxf_lookat(cameraTransform, node->prevPos, node->prevFocus, node->roll);
++        ar_camera_lookat(cameraTransform, node->prevPos, node->prevFocus, node->roll);
+         mtxf_mul(gMatStackPrev[gMatStackIndex + 1], cameraTransform, gMatStackPrev[gMatStackIndex]);
+     } else {
+-        mtxf_lookat(cameraTransform, node->pos, node->focus, node->roll);
++        ar_camera_lookat(cameraTransform, node->pos, node->focus, node->roll);
+         mtxf_mul(gMatStackPrev[gMatStackIndex + 1], cameraTransform, gMatStackPrev[gMatStackIndex]);
+     }
+     node->prevTimestamp = gGlobalTimer;
+@@ -1015,14 +1039,14 @@ static void geo_process_billboard(struct GraphNodeBillboard *node) {
+ 
+     // current frame
+     vec3s_to_vec3f(translation, node->translation);
+-    mtxf_billboard(gMatStack[nextMatStackIndex], gMatStack[gMatStackIndex], translation, gCurGraphNodeCamera->roll);
++    ar_billboard(gMatStack[nextMatStackIndex], gMatStack[gMatStackIndex], translation, gCurGraphNodeCamera->roll, FALSE);
+ 
+     // previous frame
+     geo_update_interpolation(node->translation, NULL, NULL,
+         if (geo_should_interpolate(interp)) {
+             vec3s_to_vec3f(translation, interp->translation);
+         }
+-        mtxf_billboard(gMatStackPrev[nextMatStackIndex], gMatStackPrev[gMatStackIndex], translation, gCurGraphNodeCamera->roll);
++        ar_billboard(gMatStackPrev[nextMatStackIndex], gMatStackPrev[gMatStackIndex], translation, gCurGraphNodeCamera->roll, FALSE);
+     );
+ 
+     if (gCurGraphNodeHeldObject != NULL) {
+@@ -1470,6 +1494,8 @@ static s32 obj_is_in_view(struct GraphNodeObject *node, Mat4 matrix) {
+         return FALSE;
+     } else if (node->skipInViewCheck) {
+         return TRUE;
++    } else if (gArMode) {
++        return TRUE;   /* AR: the view is identity, not Lakitu's; the whole diorama is in view */
+     }
+ 
+     // ! @bug The aspect ratio is not accounted for. When the fov value is 45,
+@@ -1505,7 +1531,7 @@ static s32 obj_is_in_view(struct GraphNodeObject *node, Mat4 matrix) {
+     //  makes PU travel safe when the camera is locked on the main map.
+     //  If Mario were rendered with a depth over 65536 it would cause overflow
+     //  when converting the transformation matrix to a fixed point matrix.
+-    if (configDrawDistance != 6 && matrix[3][2] < -20000.0f - cullingRadius) {
++    if (!draw_distance_far_plane_unbounded() && matrix[3][2] < -20000.0f - cullingRadius) {
+         return FALSE;
+     }
+ 
+@@ -1601,8 +1627,8 @@ static void geo_process_object(struct Object *node) {
+ 
+             vec3f_copy(node->header.gfx.prevPos, node->header.gfx.pos);
+             node->header.gfx.prevTimestamp = gGlobalTimer;
+-            mtxf_cylboard(gMatStack[gMatStackIndex + 1], gMatStack[gMatStackIndex], node->header.gfx.pos, gCurGraphNodeCamera->roll);
+-            mtxf_cylboard(gMatStackPrev[gMatStackIndex + 1], gMatStackPrev[gMatStackIndex], posPrev, gCurGraphNodeCamera->roll);
++            ar_billboard(gMatStack[gMatStackIndex + 1], gMatStack[gMatStackIndex], node->header.gfx.pos, gCurGraphNodeCamera->roll, TRUE);
++            ar_billboard(gMatStackPrev[gMatStackIndex + 1], gMatStackPrev[gMatStackIndex], posPrev, gCurGraphNodeCamera->roll, TRUE);
+ 
+         } else if (node->header.gfx.node.flags & GRAPH_RENDER_BILLBOARD && !noBillboard) {
+ 
+@@ -1618,8 +1644,8 @@ static void geo_process_object(struct Object *node) {
+ 
+             vec3f_copy(node->header.gfx.prevPos, node->header.gfx.pos);
+             node->header.gfx.prevTimestamp = gGlobalTimer;
+-            mtxf_billboard(gMatStack[gMatStackIndex + 1], gMatStack[gMatStackIndex], node->header.gfx.pos, gCurGraphNodeCamera->roll);
+-            mtxf_billboard(gMatStackPrev[gMatStackIndex + 1], gMatStackPrev[gMatStackIndex], posPrev, gCurGraphNodeCamera->roll);
++            ar_billboard(gMatStack[gMatStackIndex + 1], gMatStack[gMatStackIndex], node->header.gfx.pos, gCurGraphNodeCamera->roll, FALSE);
++            ar_billboard(gMatStackPrev[gMatStackIndex + 1], gMatStackPrev[gMatStackIndex], posPrev, gCurGraphNodeCamera->roll, FALSE);
+ 
+         } else {
+ 
+@@ -1662,9 +1688,13 @@ static void geo_process_object(struct Object *node) {
+                          scalePrev);
+         node->header.gfx.throwMatrix = &gMatStack[++gMatStackIndex];
+         node->header.gfx.throwMatrixPrev = &gMatStackPrev[gMatStackIndex];
+-        node->header.gfx.cameraToObject[0] = gMatStack[gMatStackIndex][3][0];
+-        node->header.gfx.cameraToObject[1] = gMatStack[gMatStackIndex][3][1];
+-        node->header.gfx.cameraToObject[2] = gMatStack[gMatStackIndex][3][2];
++        if (AR_GAME_HOOK(listener_vector)) {   /* AR: sounds pan and attenuate relative to the head */
++            gArGameHooks->listener_vector(node->header.gfx.cameraToObject, gMatStack[gMatStackIndex][3]);
++        } else {
++            node->header.gfx.cameraToObject[0] = gMatStack[gMatStackIndex][3][0];
++            node->header.gfx.cameraToObject[1] = gMatStack[gMatStackIndex][3][1];
++            node->header.gfx.cameraToObject[2] = gMatStack[gMatStackIndex][3][2];
++        }
+ 
+         // FIXME: correct types
+         if (node->header.gfx.animInfo.curAnim != NULL) {
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index 6a18656..76b68c6 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -21,6 +21,9 @@ struct GfxArHooks {
+ };
+ extern struct GfxArHooks *gGfxArHooks;   /* NULL = upstream behaviour */
+ extern bool gArMode;
++/* With gArMode: the cannon the local Mario aims from stays drawn and its barrel follows the aim (default on); off: vanilla
++ * (hidden while aiming). It changes object state (the cannon's angles), so the adapter records it with the setup. */
++extern bool gArCannonVisible;
+ 
+ /* Game code: emit a tag into the display list being built. No-op unless gArMode. */
+ #define GFX_AR_EMIT_TAG(kind, arg) do { if (gArMode) { gDPNoOpTag(gDisplayListHead++, GFX_AR_TAG(kind, arg)); } } while (0)

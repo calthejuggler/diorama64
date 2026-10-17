@@ -1,0 +1,613 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sm64ar <sm64ar@localhost>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Title screen head, splash logo and game-over backdrop
+
+Puts the title screen's Mario head (Goddard) on the table:
+
+- the head draws in world space and is lit as an object; its hand cursor is
+  its own overlay group and is never put in AR mode;
+- seams in src/goddard/ar_goddard.h map between the cursor and Goddard's
+  world, give the gd camera's view direction and let the host move the
+  cursor (pinch input);
+- with eye follow on, the eyes follow the cursor also during the head's
+  normal animation, but only on frames where the face is as in vanilla's
+  still pose (a mask built from the animation);
+- the splash logo's overshoot grows up from its floor instead of about its
+  centre, and the game-over backdrop is its own overlay group behind the
+  head.
+
+Off (the default without gArMode), all of it is vanilla.
+---
+ levels/intro/leveldata.c   |   4 ++
+ src/game/mario_misc.c      |  15 ++++
+ src/goddard/ar_goddard.h   |  28 ++++++++
+ src/goddard/draw_objects.c |   5 ++
+ src/goddard/joints.c       | 140 ++++++++++++++++++++++++++++++++++++-
+ src/goddard/renderer.c     |  88 +++++++++++++++++++++--
+ src/goddard/renderer.h     |   3 +
+ src/menu/intro_geo.c       |  32 ++++++++-
+ src/pc/gfx/gfx_ar_hooks.h  |   5 ++
+ 9 files changed, 311 insertions(+), 9 deletions(-)
+
+diff --git a/levels/intro/leveldata.c b/levels/intro/leveldata.c
+index 70d0f7d..e4c691f 100644
+--- a/levels/intro/leveldata.c
++++ b/levels/intro/leveldata.c
+@@ -6,6 +6,7 @@
+ #include "types.h"
+ 
+ #include "make_const_nonconst.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ // 0x07000000 - 0x07000100
+ ROM_ASSET_LOAD_VTX(intro_seg7_vertex_07000000, 0x0026a3a0, 20598, 0x00000000, 256);
+@@ -1020,7 +1021,10 @@ static const Gfx intro_seg7_dl_07009E38[] = {
+ // 0x0700ADC0 - 0x0700B3A0
+ static const Gfx intro_seg7_dl_0700ADC0[] = {
+     gsSPVertex(intro_seg7_vertex_07006AC0, 16, 0),
++    gsDPNoOpTag(GFX_AR_TAG(GFX_AR_TAG_SPACE, GFX_AR_SPACE_DISCARD)),   /* AR: the logo's black backing quad, invisible on
++                                                                          the N64's black screen, is a black card on the table */
+     gsSP2Triangles( 0,  1,  2, 0x0,  0,  3,  1, 0x0),
++    gsDPNoOpTag(GFX_AR_TAG(GFX_AR_TAG_SPACE, GFX_AR_SPACE_WORLD)),
+     gsSP2Triangles( 4,  5,  6, 0x0,  7,  8,  9, 0x0),
+     gsSP2Triangles(10,  7,  9, 0x0,  7, 11, 12, 0x0),
+     gsSP2Triangles( 7, 12,  8, 0x0, 13, 14,  7, 0x0),
+diff --git a/src/game/mario_misc.c b/src/game/mario_misc.c
+index f6ca734..33a2cd1 100644
+--- a/src/game/mario_misc.c
++++ b/src/game/mario_misc.c
+@@ -28,6 +28,7 @@
+ #include "pc/network/network.h"
+ #include "pc/lua/smlua_hooks.h"
+ #include "pc/mods/mods.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ #define TOAD_STAR_1_REQUIREMENT gBehaviorValues.ToadStar1Requirement
+ #define TOAD_STAR_2_REQUIREMENT gBehaviorValues.ToadStar2Requirement
+@@ -117,6 +118,20 @@ Gfx *geo_draw_mario_head_goddard(s32 callContext, struct GraphNode *node, Mat4 *
+             gd_copy_p1_contpad(gPlayer1Controller->controllerData);
+         }
+         gfx = (Gfx *) PHYSICAL_TO_VIRTUAL(gdm_gettestdl(asGenerated->parameter));
++        if (gArMode && gfx != NULL) {   /* AR: the head is a model on the table, in Goddard's world units: gd puts its
++                                           perspective and its look-at in the projection, which WORLD drops */
++            Gfx *w = alloc_display_list(6 * sizeof(Gfx));
++            if (w != NULL) {
++                Gfx *p = w;
++                gDPNoOpTag(p++, GFX_AR_TAG(GFX_AR_TAG_SPACE, GFX_AR_SPACE_WORLD));
++                gDPNoOpTag(p++, GFX_AR_TAG(GFX_AR_TAG_ROLE, GFX_AR_ROLE_GODDARD));
++                gSPDisplayList(p++, gfx);
++                gDPNoOpTag(p++, GFX_AR_TAG(GFX_AR_TAG_ROLE, GFX_AR_ROLE_TERRAIN));
++                gDPNoOpTag(p++, GFX_AR_TAG(GFX_AR_TAG_SPACE, GFX_AR_SPACE_SCREEN));
++                gSPEndDisplayList(p++);
++                gfx = w;
++            }
++        }
+         gGoddardVblankCallback = gd_vblank;
+         sfx = gd_sfx_to_play();
+         play_menu_sounds(sfx);
+diff --git a/src/goddard/ar_goddard.h b/src/goddard/ar_goddard.h
+index e69de29..3445603 100644
+--- a/src/goddard/ar_goddard.h
++++ b/src/goddard/ar_goddard.h
+@@ -0,0 +1,28 @@
++#ifndef AR_GODDARD_H
++#define AR_GODDARD_H
++/* AR seams for pinch input on the title head. Plain floats: no gd types cross. gd's cursor is gGdCtrl.csrX/Y in its
++ * 320x240 view pixels; world points are Goddard world units (what the head's WORLD draws are in). */
++#include <PR/ultratypes.h>
++s32  ar_goddard_world_to_cursor(const f32 p[3], f32 out[2]);   /* as check_grabable_click projects a grab point; 0: no camera or behind it */
++s32  ar_goddard_cursor_to_world(f32 out[3]);                    /* the cursor's ray at the depth of gd's world origin; 0: no camera */
++s32  ar_goddard_camera_forward(f32 out[3]);
++void ar_goddard_set_cursor(f32 x, f32 y);
++void ar_goddard_get_cursor(f32 out[2]);
++/* with eye follow on, gd's eye maths (vanilla's: each eye from its own screen place, 2 x (cursor -
++ * eye), capped at 30) also run in the head's normal animation (vanilla: only its still pose after a grab, state 7; never
++ * the game-over head's dizzy spell), and there only where the face is as in that still pose (ar_goddard_eyes_still_at).
++ * Off: vanilla. */
++void ar_goddard_set_eye_follow(s32 on);
++/* at this frame of the head's normal animation the face is as in vanilla's still pose (frame 660): both lids
++ * at most 2 degrees more closed, both eyes' own look within 6 degrees, the head within 20 degrees and 100 units, at it and
++ * the next keyframe; in runs of at least 15 keyframes */
++s32  ar_goddard_eyes_still_at(f32 frame);
++s32  ar_goddard_eyes_still_status(void);
++void ar_goddard_still_mask(const u8 *pose, s32 n, s32 run, u8 *out);
++u32  ar_goddard_eye_offsets(f32 left[2], f32 right[2]);
++u32  ar_goddard_eye_screens(f32 left[2], f32 right[2]);
++u32  ar_goddard_eye_offset(f32 out[2]);
++s32  ar_goddard_eyes_world(f32 out[3]);
++f32  ar_goddard_eye_frame(void);
++u32  ar_goddard_eye_still_skips(void);
++#endif
+diff --git a/src/goddard/draw_objects.c b/src/goddard/draw_objects.c
+index e0f601a..454e05c 100644
+--- a/src/goddard/draw_objects.c
++++ b/src/goddard/draw_objects.c
+@@ -15,6 +15,7 @@
+ #include "draw_objects.h"
+ 
+ #include "gfx_dimensions.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ /**
+  * @file draw_objects.c
+@@ -257,7 +258,11 @@ void draw_shape_2d(struct ObjShape *shape, s32 flag, UNUSED f32 c, UNUSED f32 d,
+         }
+         gd_dl_load_trans_matrix(sp1C.x, sp1C.y, sp1C.z);
+     }
++    /* AR: camera-space 2D shapes (sparkles, light gizmos) have no place on the table. The tag pair is skipped when
++     * the list is nearly full or the frame's tag budget is spent (the shape then draws as before; gd_dl_ar_space). */
++    const s32 arDiscard = gArMode && gd_dl_ar_space(GFX_AR_SPACE_DISCARD, 32);
+     draw_shape_faces(shape);
++    if (arDiscard) { gd_dl_ar_space(GFX_AR_SPACE_WORLD, 0); }   /* back to the head's WORLD (the title head wrapper) */
+     split_timer("drawshape2d");
+ }
+ 
+diff --git a/src/goddard/joints.c b/src/goddard/joints.c
+index 0863118..27a9279 100644
+--- a/src/goddard/joints.c
++++ b/src/goddard/joints.c
+@@ -18,6 +18,9 @@
+ #include "sfx.h"
+ #include "skin.h"
+ #include "skin_movement.h"
++#include "ar_goddard.h"
++#include "shape_helper.h"
++#include "dynlists/animdata.h"
+ 
+ // data
+ static s32 D_801A82D0 = 0;
+@@ -130,6 +133,123 @@ void grabbable_joint_update_func(struct ObjJoint *self) {
+     }
+ }
+ 
++/* AR: eye follow (ar_goddard.h). gd's eye maths below are vanilla's; the follow only lets them run
++ * outside the still pose, where the face is as in it (ar_goddard_eyes_still_at). The rest records what they did, for tests. */
++static s32 sArEyeFollow;
++static struct ObjJoint *sArEyeJ[2];
++static f32 sArEyeAt[2][3], sArEyeScr[2][2], sArEyeOff[2][2];
++static u32 sArEyeCount, sArEyeStillSkips;
++static f32 sArEyeFrame;
++void ar_goddard_set_eye_follow(s32 on) { sArEyeFollow = on; }
++static s32 ar_eye_slot(struct ObjJoint *j) {
++    if (sArEyeJ[0] == j) { return 0; }
++    if (sArEyeJ[1] == j) { return 1; }
++    if (sArEyeJ[0] == NULL) { sArEyeJ[0] = j; return 0; }
++    if (sArEyeJ[1] == NULL) { sArEyeJ[1] = j; return 1; }
++    sArEyeJ[0] = j; sArEyeJ[1] = NULL;
++    return 0;
++}
++/* the face is still at a keyframe of the head's normal animation when it is as in vanilla's still pose (frame
++ * 660, where state 7 holds the head; rotations in the animations' 0.1 degree units): both lids at most AR_EYE_LID_SLACK
++ * more closed (they close by rotating up their z), both eyes' own animated look within AR_EYE_LOOK_SLACK, the head
++ * within AR_EYE_HEAD_ROT_SLACK and AR_EYE_HEAD_POS_SLACK gd units, at that keyframe and the next (move_animator blends
++ * toward it; the last's next is the first). The follow runs on still keyframes in runs of at least AR_EYE_STILL_RUN (no twitch). */
++#define AR_EYE_STILL_FRAME 660
++#define AR_EYE_LID_SLACK 20
++#define AR_EYE_LOOK_SLACK 60
++#define AR_EYE_HEAD_ROT_SLACK 200
++#define AR_EYE_HEAD_POS_SLACK 100
++#define AR_EYE_STILL_RUN 15
++#define AR_EYE_STILL_MAX 1024
++static s32 ar_eye_anim_ok(struct AnimDataInfo *a, s32 type, s32 stride) {
++    return a[0].type == type && a[0].data != NULL && a[0].count >= AR_EYE_STILL_FRAME && a[0].count < AR_EYE_STILL_MAX;
++}
++static s32 ar_eye_dev(struct AnimDataInfo *a, s32 stride, s32 f, s32 k0, s32 n, s32 up) {
++    s16 *d = (s16 *) a[0].data;
++    s32 k, m = 0, v;
++    for (k = k0; k < k0 + n; k++) {
++        v = d[(f - 1) * stride + k] - d[(AR_EYE_STILL_FRAME - 1) * stride + k];
++        if (!up && v < 0) { v = -v; }
++        if (v > m) { m = v; }
++    }
++    return m;
++}
++static s32 ar_eye_pose_ok(s32 f) {
++    return ar_eye_dev(anim_mario_eyelid_left, 3, f, 2, 1, TRUE) <= AR_EYE_LID_SLACK
++           && ar_eye_dev(anim_mario_eyelid_right, 3, f, 2, 1, TRUE) <= AR_EYE_LID_SLACK
++           && ar_eye_dev(anim_mario_eye_left, 3, f, 0, 3, FALSE) <= AR_EYE_LOOK_SLACK
++           && ar_eye_dev(anim_mario_eye_right, 3, f, 0, 3, FALSE) <= AR_EYE_LOOK_SLACK
++           && ar_eye_dev(anim_mario_intro, 6, f, 0, 3, FALSE) <= AR_EYE_HEAD_ROT_SLACK
++           && ar_eye_dev(anim_mario_intro, 6, f, 3, 3, FALSE) <= AR_EYE_HEAD_POS_SLACK;
++}
++static u8 sArEyeStill[AR_EYE_STILL_MAX], sArEyePose[AR_EYE_STILL_MAX];
++static s32 sArEyeStillN;
++static s32 sArEyeStillStatus;
++/* pose[f], out[f] for f in 1..n: out[f] = pose[f] and pose of the next keyframe (n's next is 1: move_animator wraps),
++ * then runs shorter than run dropped */
++void ar_goddard_still_mask(const u8 *pose, s32 n, s32 run, u8 *out) {
++    s32 f, g, k;
++    for (f = 1; f <= n; f++) { out[f] = pose[f] && pose[f == n ? 1 : f + 1]; }
++    for (f = 1; f <= n; f = g) {
++        for (g = f; g <= n && out[g] == out[f]; g++) { }
++        if (out[f] && g - f < run) { for (k = f; k < g; k++) { out[k] = 0; } }
++    }
++}
++static void ar_eye_still_make(void) {
++    s32 n = anim_mario_eyelid_left[0].count, f;
++    sArEyeStillStatus = -1;
++    if (!ar_eye_anim_ok(anim_mario_eyelid_left, GD_ANIM_ROT3S, 3) || !ar_eye_anim_ok(anim_mario_eyelid_right, GD_ANIM_ROT3S, 3)
++        || !ar_eye_anim_ok(anim_mario_eye_left, GD_ANIM_ROT3S, 3) || !ar_eye_anim_ok(anim_mario_eye_right, GD_ANIM_ROT3S, 3)
++        || !ar_eye_anim_ok(anim_mario_intro, GD_ANIM_ROT3S_POS3S, 6)) { return; }
++    if (anim_mario_eyelid_right[0].count < n) { n = anim_mario_eyelid_right[0].count; }
++    if (anim_mario_eye_left[0].count < n) { n = anim_mario_eye_left[0].count; }
++    if (anim_mario_eye_right[0].count < n) { n = anim_mario_eye_right[0].count; }
++    if (anim_mario_intro[0].count < n) { n = anim_mario_intro[0].count; }
++    /* the still pose's lid is never at 0 once the ROM's animations are loaded (retried: -1 until then) */
++    if (((s16 *) anim_mario_eyelid_left[0].data)[(AR_EYE_STILL_FRAME - 1) * 3 + 2] == 0) { return; }
++    for (f = 1; f <= n; f++) { sArEyePose[f] = ar_eye_pose_ok(f); }
++    ar_goddard_still_mask(sArEyePose, n, AR_EYE_STILL_RUN, sArEyeStill);
++    sArEyeStillN = n; sArEyeStillStatus = 1;
++}
++s32 ar_goddard_eyes_still_status(void) {
++    if (sArEyeStillN == 0) { ar_eye_still_make(); }
++    return sArEyeStillStatus;
++}
++s32 ar_goddard_eyes_still_at(f32 frame) {
++    s32 f = (s32) frame;   /* the keyframe move_animator draws */
++    if (sArEyeStillN == 0) { ar_eye_still_make(); }
++    return sArEyeStillN > 0 && f >= 1 && f <= sArEyeStillN && sArEyeStill[f];
++}
++u32 ar_goddard_eye_offset(f32 out[2]) {
++    if (sArEyeCount == 0) { return 0; }
++    if (sArEyeJ[1] == NULL) { out[0] = sArEyeOff[0][0]; out[1] = sArEyeOff[0][1]; return sArEyeCount; }
++    out[0] = 0.5f * (sArEyeOff[0][0] + sArEyeOff[1][0]); out[1] = 0.5f * (sArEyeOff[0][1] + sArEyeOff[1][1]);
++    return sArEyeCount;
++}
++static s32 ar_eye_left(void) { return sArEyeScr[0][0] <= sArEyeScr[1][0] ? 0 : 1; }
++u32 ar_goddard_eye_offsets(f32 left[2], f32 right[2]) {
++    s32 l;
++    if (sArEyeCount == 0 || sArEyeJ[1] == NULL) { return 0; }
++    l = ar_eye_left();
++    left[0] = sArEyeOff[l][0]; left[1] = sArEyeOff[l][1]; right[0] = sArEyeOff[1 - l][0]; right[1] = sArEyeOff[1 - l][1];
++    return sArEyeCount;
++}
++u32 ar_goddard_eye_screens(f32 left[2], f32 right[2]) {
++    s32 l;
++    if (sArEyeCount == 0 || sArEyeJ[1] == NULL) { return 0; }
++    l = ar_eye_left();
++    left[0] = sArEyeScr[l][0]; left[1] = sArEyeScr[l][1]; right[0] = sArEyeScr[1 - l][0]; right[1] = sArEyeScr[1 - l][1];
++    return sArEyeCount;
++}
++s32 ar_goddard_eyes_world(f32 out[3]) {
++    s32 k;
++    if (sArEyeCount == 0 || sArEyeJ[1] == NULL) { return 0; }
++    for (k = 0; k < 3; k++) { out[k] = 0.5f * (sArEyeAt[0][k] + sArEyeAt[1][k]); }
++    return 1;
++}
++f32 ar_goddard_eye_frame(void) { return sArEyeFrame; }
++u32 ar_goddard_eye_still_skips(void) { return sArEyeStillSkips; }
++
+ /**
+  * Update function for Mario's eye joints, which makes them follow the cursor
+  */
+@@ -147,8 +267,17 @@ void eye_joint_update_func(struct ObjJoint *self) {
+ 
+     if (self->rootAnimator != NULL) {
+         if (self->rootAnimator->state != 7) {
+-            return;
++            /* AR: with eye follow, also in the head's normal animation, where its face is still */
++            if (!sArEyeFollow || self->rootAnimator->controlFunc != animate_mario_head_normal
++                || self->rootAnimator->animSeqNum != 0) {
++                return;
++            }
++            if (!ar_goddard_eyes_still_at(self->rootAnimator->frame)) {
++                sArEyeStillSkips++;
++                return;
++            }
+         }
++        sArEyeFrame = self->rootAnimator->frame;
+     }
+ 
+     set_cur_dynobj((struct GdObj *)self);
+@@ -156,6 +285,10 @@ void eye_joint_update_func(struct ObjJoint *self) {
+     sp44.x = (*sp5C)[3][0];
+     sp44.y = (*sp5C)[3][1];
+     sp44.z = (*sp5C)[3][2];
++    {
++        s32 slot = ar_eye_slot(self);
++        sArEyeAt[slot][0] = sp44.x; sArEyeAt[slot][1] = sp44.y; sArEyeAt[slot][2] = sp44.z;
++    }
+     world_pos_to_screen_coords(&sp44, sCurrentMoveCamera, sCurrentMoveView);
+ 
+     sp50.x = gGdCtrl.csrX - sp44.x;
+@@ -171,6 +304,11 @@ void eye_joint_update_func(struct ObjJoint *self) {
+         sp50.y *= 30.0f;
+         sp50.z *= 30.0f;
+     }
++    {
++        s32 slot = sArEyeJ[0] == self ? 0 : 1;
++        sArEyeScr[slot][0] = sp44.x; sArEyeScr[slot][1] = sp44.y;
++        sArEyeOff[slot][0] = sp50.x; sArEyeOff[slot][1] = sp50.y; sArEyeCount++;
++    }
+ 
+     for (att = self->attachedObjsGrp->firstMember; att != NULL; att = att->next) {
+         attobj = att->obj;
+diff --git a/src/goddard/renderer.c b/src/goddard/renderer.c
+index 635d057..9311876 100644
+--- a/src/goddard/renderer.c
++++ b/src/goddard/renderer.c
+@@ -26,8 +26,11 @@
+ 
+ #include "config.h"
+ #include "gfx_dimensions.h"
++#include "pc/gfx/gfx_ar_hooks.h"
++#include "ar_goddard.h"
+ 
+ #define MAX_GD_DLS 1000
++#define GD_AR_TAG_BUDGET 256   /* AR: gd_dl_ar_space tags per frame at most (measured peak 176) */
+ #define OS_MESG_SI_COMPLETE 0x33333333
+ 
+ #define GD_VIRTUAL_TO_PHYSICAL(addr) (addr)
+@@ -151,6 +154,7 @@ static struct GdObj *sMenuGadgets[9]; // @ 801BD778; d_obj ptr storage? menu?
+ static struct ObjView *sDebugViews[2];  // Seems to be a list of ObjViews for displaying debug info
+ static struct GdDisplayList *sStaticDl;     // @ 801BD7A8
+ static struct GdDisplayList *sDynamicMainDls[2]; // @ 801BD7B0
++static s32 sArGdTags;
+ static struct GdDisplayList *sGdDlStash;    // @ 801BD7B8
+ static struct GdDisplayList *sMHeadMainDls[2]; // @ 801BD7C0; two DLs, double buffered one per frame - seem to be basic dls that branch to actual lists?
+ static struct GdDisplayList *sViewDls[3][2];       // I guess? 801BD7C8 -> 801BD7E0?
+@@ -1089,6 +1093,7 @@ void gdm_setup(void) {
+     imin("gdm_setup");
+     sYoshiSceneGrp = NULL;
+     sMarioSceneGrp = NULL;
++    if (gArMode) { sMSceneView = NULL; }   /* AR: the ar_goddard_* seams never see a view from the last head */
+     sUpdateYoshiScene = FALSE;
+     sUpdateMarioScene = FALSE;
+     sCarGdDlNum = 0;
+@@ -1523,6 +1528,7 @@ void gd_set_color_fb(void) {
+ 
+ /* 24CF2C -> 24CFCC; orig name: func_8019E75C */
+ void reset_cur_dl_indices(void) {
++    sArGdTags = 0;
+     sMHeadMainDls[gGdFrameBufNum]->curGfxIdx = 0;
+     sCurrentGdDl = sDynamicMainDls[gGdFrameBufNum];
+     sCurrentGdDl->curVtxIdx = 0;
+@@ -1681,6 +1687,18 @@ void gd_dl_mul_trans_matrix(f32 x, f32 y, f32 z) {
+     next_mtx();
+ }
+ 
++s32 gd_dl_ar_space(s32 space, s32 reserve) {   /* AR: only called inside a gArMode gate */
++    /* A tag that leaves WORLD books itself and the restore after it in this frame's budget: the frame's tags never
++     * exceed GD_AR_TAG_BUDGET, the extra room the dynamic lists have with gArMode, so they can never make vanilla's own
++     * next_gfx overflow (vanilla fits in 600). Past the budget the tags are skipped (the shape draws as before). */
++    const s32 cost = space == GFX_AR_SPACE_WORLD ? 0 : 2;
++    if (sCurrentGdDl == NULL || sCurrentGdDl->curGfxIdx + 1 + reserve > sCurrentGdDl->totalGfx ||
++        sArGdTags + cost > GD_AR_TAG_BUDGET) { return 0; }
++    sArGdTags += cost;
++    gDPNoOpTag(next_gfx(), GFX_AR_TAG(GFX_AR_TAG_SPACE, space));
++    return 1;
++}
++
+ /**
+  * Adds a display list operation that loads a translation matrix.
+  */
+@@ -2935,6 +2953,58 @@ void Unknown801A4B04(void) {
+ }
+ 
+ /* 2533DC -> 253728; orig name: func_801A4C0C */
++/* AR seams (ar_goddard.h): always the Mario scene view and its camera, never the last-updated view (the hand's). */
++static struct ObjCamera *ar_mscene_cam(void) { return sMSceneView != NULL ? sMSceneView->activeCam : NULL; }
++static f32 ar_view_half(int axis) {   /* the scene view's half size, as world_pos_to_screen_coords adds it */
++    return axis ? sMSceneView->lowerRight.y / 2.0f : sMSceneView->lowerRight.x / 2.0f;
++}
++s32 ar_goddard_world_to_cursor(const f32 p[3], f32 out[2]) {
++    struct ObjCamera *cam = ar_mscene_cam();
++    struct GdVec3f v;
++    if (cam == NULL) { return 0; }
++    v.x = p[0]; v.y = p[1]; v.z = p[2];
++    gd_rotate_and_translate_vec3f(&v, &cam->unkE8);                /* world_pos_to_screen_coords, step by step */
++    if (v.z > -256.0f) { return 0; }
++    out[0] = v.x * (256.0 / -v.z) + ar_view_half(0);
++    out[1] = v.y * (256.0 / v.z) + ar_view_half(1);
++    return 1;
++}
++s32 ar_goddard_cursor_to_world(f32 out[3]) {
++    struct ObjCamera *cam = ar_mscene_cam();
++    struct GdVec3f o, w;
++    Mat4f inv;
++    if (cam == NULL) { return 0; }
++    o.x = 0.0f; o.y = 0.0f; o.z = 0.0f;
++    gd_rotate_and_translate_vec3f(&o, &cam->unkE8);
++    if (o.z > -256.0f) { return 0; }
++    w.x = (gGdCtrl.csrX - ar_view_half(0)) * -o.z / 256.0f;       /* the inverse of world_pos_to_screen_coords */
++    w.y = (gGdCtrl.csrY - ar_view_half(1)) * o.z / 256.0f;
++    w.z = o.z;
++    gd_inverse_mat4f(&cam->unkE8, &inv);
++    gd_rotate_and_translate_vec3f(&w, &inv);
++    out[0] = w.x; out[1] = w.y; out[2] = w.z;
++    return 1;
++}
++s32 ar_goddard_camera_forward(f32 out[3]) {   /* camera space looks down -z (world_pos_to_screen_coords) */
++    struct ObjCamera *cam = ar_mscene_cam();
++    struct GdVec3f o, f;
++    Mat4f inv;
++    f32 n;
++    if (cam == NULL) { return 0; }
++    gd_inverse_mat4f(&cam->unkE8, &inv);
++    o.x = 0.0f; o.y = 0.0f; o.z = 0.0f;
++    f.x = 0.0f; f.y = 0.0f; f.z = -1.0f;
++    gd_rotate_and_translate_vec3f(&o, &inv);
++    gd_rotate_and_translate_vec3f(&f, &inv);
++    out[0] = f.x - o.x; out[1] = f.y - o.y; out[2] = f.z - o.z;
++    n = sqrtf(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
++    if (!(n > 1e-6f)) { return 0; }
++    out[0] /= n; out[1] /= n; out[2] /= n;
++    return 1;
++}
++void ar_goddard_set_cursor(f32 x, f32 y) { gGdCtrl.csrX = (s32) x; gGdCtrl.csrY = (s32) y; }
++void ar_goddard_get_cursor(f32 out[2]) { out[0] = gGdCtrl.csrX; out[1] = gGdCtrl.csrY; }
++
+ void update_cursor(void) {
+     if (sHandView == NULL)
+         return;
+@@ -2954,11 +3024,17 @@ void update_cursor(void) {
+ 
+     // Make hand display list
+     begin_gddl(sHandShape->dlNums[gGdFrameBufNum]);
+-    if (gGdCtrl.dragging) {
++    if (gArMode) { gDPNoOpTag(next_gfx(), GFX_AR_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_CURSOR)); }
++    if (gArMode) {
++        /* AR: the hand sprite is never put in AR mode, in any title state (the title head, the
++         * dizzy head, a head's first frames): the list keeps only the CURSOR tags. gd's cursor, its grab and its sounds
++         * are unchanged. */
++    } else if (gGdCtrl.dragging) {
+         gd_put_sprite((u16 *) gd_texture_hand_closed, sHandView->upperLeft.x, sHandView->upperLeft.y, 0x20, 0x20);
+     } else {
+         gd_put_sprite((u16 *) gd_texture_hand_open, sHandView->upperLeft.x, sHandView->upperLeft.y, 32, 32);
+     }
++    if (gArMode) { gDPNoOpTag(next_gfx(), GFX_AR_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_CURSOR)); }
+     gd_enddlsplist_parent();
+ 
+     if (sHandView->upperLeft.x < sHandView->parent->upperLeft.x) {
+@@ -3137,8 +3213,8 @@ void gd_init(void) {
+     stop_memtracker("Static DL");
+ 
+     start_memtracker("Dynamic DLs");
+-    sDynamicMainDls[0] = new_gd_dl(1, 600, 10, 200, 10, 3);
+-    sDynamicMainDls[1] = new_gd_dl(1, 600, 10, 200, 10, 3);
++    sDynamicMainDls[0] = new_gd_dl(1, 600 + (gArMode ? GD_AR_TAG_BUDGET : 0), 10, 200, 10, 3);   /* AR: + the tags' room */
++    sDynamicMainDls[1] = new_gd_dl(1, 600 + (gArMode ? GD_AR_TAG_BUDGET : 0), 10, 200, 10, 3);
+     stop_memtracker("Dynamic DLs");
+ 
+     sMHeadMainDls[0] = new_gd_dl(1, 100, 0, 0, 0, 0);
+@@ -3456,10 +3532,12 @@ void gd_setup_cursor(struct ObjGroup *parentgrp) {
+ 
+     sHandShape = make_shape(0, "mouse");
+     sHandShape->dlNums[0] = gd_startdisplist(7);
+-    gd_put_sprite((u16 *) gd_texture_hand_open, 100, 100, 32, 32);
++    if (!gArMode) { gd_put_sprite((u16 *) gd_texture_hand_open, 100, 100, 32, 32); }
++    if (gArMode) { gDPNoOp(next_gfx()); gDPNoOp(next_gfx()); }   /* AR: room for update_cursor's two CURSOR tags */
+     gd_enddlsplist_parent();
+     sHandShape->dlNums[1] = gd_startdisplist(7);
+-    gd_put_sprite((u16 *) gd_texture_hand_open, 100, 100, 32, 32);
++    if (!gArMode) { gd_put_sprite((u16 *) gd_texture_hand_open, 100, 100, 32, 32); }
++    if (gArMode) { gDPNoOp(next_gfx()); gDPNoOp(next_gfx()); }
+     gd_enddlsplist_parent();
+ 
+     d_start_group("mouseg");
+diff --git a/src/goddard/renderer.h b/src/goddard/renderer.h
+index dfd9fe7..206afeb 100644
+--- a/src/goddard/renderer.h
++++ b/src/goddard/renderer.h
+@@ -71,6 +71,9 @@ void gd_dl_push_matrix(void);
+ void gd_dl_pop_matrix(void);
+ void gd_dl_mul_trans_matrix(f32 x, f32 y, f32 z);
+ void gd_dl_load_trans_matrix(f32 x, f32 y, f32 z);
++/* AR: a GFX_AR_SPACE_* tag into gd's display list. 0 (nothing written) when fewer than `reserve` more Gfx would fit
++ * after it (gd's lists are fixed-size and an overflow is fatal). */
++s32 gd_dl_ar_space(s32 space, s32 reserve);
+ void gd_dl_scale(f32 x, f32 y, f32 z);
+ void func_8019F2C4(f32 arg0, s8 arg1);
+ void gd_dl_lookat(struct ObjCamera *cam, f32 arg1, f32 arg2, f32 arg3, f32 arg4, f32 arg5, f32 arg6, f32 arg7);
+diff --git a/src/menu/intro_geo.c b/src/menu/intro_geo.c
+index ce36977..d1d5291 100644
+--- a/src/menu/intro_geo.c
++++ b/src/menu/intro_geo.c
+@@ -16,6 +16,7 @@
+ #include "gfx_dimensions.h"
+ #include "game/rendering_graph_node.h"
+ #include "pc/utils/misc.h"
++#include "pc/gfx/gfx_ar_hooks.h"
+ 
+ // frame counts for the zoom in, hold, and zoom out of title model
+ #define INTRO_STEPS_ZOOM_IN 20
+@@ -62,6 +63,9 @@ void patch_title_screen_interpolated(f32 delta) {
+     }
+ }
+ 
++bool gArSplashLift = false;
++float gArSplashFloorY = 0.0f;
++
+ /**
+  * Geo callback to render the "Super Mario 64" logo on the title screen
+  */
+@@ -81,7 +85,7 @@ Gfx *geo_intro_super_mario_64_logo(s32 state, struct GraphNode *node, UNUSED voi
+     } else if (state == 1) {
+         graphNode->flags = (graphNode->flags & 0xFF) | (LAYER_OPAQUE << 8);
+         scaleMat = alloc_display_list(sizeof(*scaleMat));
+-        dl = alloc_display_list(4 * sizeof(*dl));
++        dl = alloc_display_list((gArMode ? 7 : 4) * sizeof(*dl));   /* AR: + the ROLE tags; + the lift */
+         if (scaleMat == NULL || dl == NULL) { return NULL; }
+         dlIter = dl;
+ 
+@@ -109,8 +113,26 @@ Gfx *geo_intro_super_mario_64_logo(s32 state, struct GraphNode *node, UNUSED voi
+         }
+         guScale(scaleMat, scaleX, scaleY, scaleZ);
+ 
+-        gSPMatrix(dlIter++, scaleMat, G_MTX_MODELVIEW | G_MTX_MUL | G_MTX_PUSH);
++        /* AR: while it overshoots (scale > 1) the logo grows up from its floor instead of about its centre: lifted by
++           floor * (1 - sy), so its bottom stays at gArSplashFloorY (the table top). One push, so the one pop below still matches.
++           Only scaleY enters the lift. That is exact for every row of vanilla's scale tables, although they are not uniform
++           (x, y, z differ): guScale is diagonal, so scaleX and scaleZ never move a point's y. A rotating or shearing scale
++           matrix would break it. */
++        Mtx *liftMat = (gArMode && gArStory && gArSplashLift && scaleY > 1.0f) ? alloc_display_list(sizeof(*liftMat)) : NULL;
++        if (liftMat != NULL) {
++            guTranslate(liftMat, 0.0f, gArSplashFloorY * (1.0f - scaleY), 0.0f);
++            gSPMatrix(dlIter++, liftMat, G_MTX_MODELVIEW | G_MTX_MUL | G_MTX_PUSH);
++            gSPMatrix(dlIter++, scaleMat, G_MTX_MODELVIEW | G_MTX_MUL | G_MTX_NOPUSH);
++        } else {
++            gSPMatrix(dlIter++, scaleMat, G_MTX_MODELVIEW | G_MTX_MUL | G_MTX_PUSH);
++        }
++        if (gArMode) {   /* AR: the logo stands on the table like the title head: lit as an object (casts, not static) */
++            gDPNoOpTag(dlIter++, GFX_AR_TAG(GFX_AR_TAG_ROLE, GFX_AR_ROLE_GODDARD));
++        }
+         gSPDisplayList(dlIter++, &intro_seg7_dl_0700B3A0);  // draw model
++        if (gArMode) {
++            gDPNoOpTag(dlIter++, GFX_AR_TAG(GFX_AR_TAG_ROLE, GFX_AR_ROLE_TERRAIN));
++        }
+         gSPPopMatrix(dlIter++, G_MTX_MODELVIEW);
+         gSPEndDisplayList(dlIter);
+ 
+@@ -250,9 +272,12 @@ Gfx *geo_intro_gameover_backdrop(s32 state, struct GraphNode *node, UNUSED void
+         sGameOverFrameCounter = 0;
+         sGameOverTableIndex = -1;
+     } else {
+-        displayList = alloc_display_list((4 + w * 3) * sizeof(*displayList));
++        displayList = alloc_display_list((((gArMode && gArStory) ? 6 : 4) + w * 3) * sizeof(*displayList));
+         if (displayList == NULL) { return NULL; }
+         displayListIter = displayList;
++        if (gArMode && gArStory) {   /* AR: the backdrop is its own group (shown behind the dizzy head); else hidden */
++            gDPNoOpTag(displayListIter++, GFX_AR_TAG(GFX_AR_TAG_GROUP_BEGIN, GFX_AR_GROUP_GAMEOVER));
++        }
+ 
+         // Wait 180 frames, then increment flipped tile index
+         if (sGameOverTableIndex == -1) {
+@@ -302,6 +327,7 @@ Gfx *geo_intro_gameover_backdrop(s32 state, struct GraphNode *node, UNUSED void
+             }
+         }
+         gSPDisplayList(displayListIter++, &title_screen_bg_dl_0A000190);
++        if (gArMode && gArStory) { gDPNoOpTag(displayListIter++, GFX_AR_TAG(GFX_AR_TAG_GROUP_END, GFX_AR_GROUP_GAMEOVER)); }
+         gSPEndDisplayList(displayListIter);
+     }
+     return displayList;
+diff --git a/src/pc/gfx/gfx_ar_hooks.h b/src/pc/gfx/gfx_ar_hooks.h
+index 2624a01..b4aa5c9 100644
+--- a/src/pc/gfx/gfx_ar_hooks.h
++++ b/src/pc/gfx/gfx_ar_hooks.h
+@@ -12,6 +12,7 @@ enum { GFX_AR_TAG_SPACE = 1, GFX_AR_TAG_GROUP_BEGIN = 2, GFX_AR_TAG_GROUP_END =
+ enum { GFX_AR_TAG_ROOM = 6 };
+ /* ROLE tag argument: what the following display lists are (lighting). */
+ enum { GFX_AR_ROLE_TERRAIN = 0, GFX_AR_ROLE_OBJECT = 1, GFX_AR_ROLE_SHADOW = 2, GFX_AR_ROLE_EFFECT = 3 };
++enum { GFX_AR_ROLE_GODDARD = 4 };
+ enum { GFX_AR_ROLE_WATER = 5, GFX_AR_ROLE_LAVA = 6 };
+ /* with gArMode, TERRAIN draws that load this texture image are drawn with the LAVA role, until the next texture image
+  * or ROLE tag: Bowser in the Fire Sea's arena draws its lava sea inside a static list (not a movtex), next to its spike
+@@ -57,6 +58,8 @@ enum { GFX_AR_OTHER_ROOMS_HIDDEN = 0, GFX_AR_OTHER_ROOMS_FROZEN = 1, GFX_AR_OTHE
+ extern int gArOtherRoomObjects;
+ extern bool gArHideOutside;
+ extern bool gArPackFloorTilt;
++extern bool gArSplashLift;
++extern float gArSplashFloorY;   /* AR: that floor (the logo's hold box bottom, model units; set by the host) */
+ /* With gArMode: the cannon the local Mario aims from stays drawn and its barrel follows the aim (default on); off: vanilla
+  * (hidden while aiming). It changes object state (the cannon's angles), so the adapter records it with the setup. */
+ extern bool gArCannonVisible;
+@@ -71,6 +74,8 @@ extern int gArScreen;
+  * culling and SCREEN tags, the whole screen inside overlay group MENU (one panel over the table). Everything else keeps the
+  * AR world rules. This is the only switch between the two. */
+ enum { GFX_AR_GROUP_MENU = 8 };
++enum { GFX_AR_GROUP_CURSOR = 10 };
++enum { GFX_AR_GROUP_GAMEOVER = 11 };
+ /* the intro picture-in-picture (Lakitu's view). While gArPipSky is set (the host sets it, render-only), a level's
+  * background node draws vanilla's skybox or fill colour again, inside overlay group PIP: the PiP's background. */
+ enum { GFX_AR_GROUP_PIP = 12 };
