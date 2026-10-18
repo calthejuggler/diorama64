@@ -27,7 +27,9 @@ def main():
               file=sys.stderr)
         return 1
     STAMP.unlink(missing_ok=True)
-    run(["gmake", "-C", SRC, f"-j{os.cpu_count()}", *BUILD_FLAGS])
+    # The sm64coopdx Makefile assumes Homebrew gcc (a versioned cpp-N) and coreutils (gcp) on macOS.
+    # Use Xcode's clang instead; -x c because the inputs (level_rules.mk, ...) are not .c files.
+    run(["gmake", "-C", SRC, f"-j{os.cpu_count()}", *BUILD_FLAGS, "CPP=clang -E -P -x c", "CP=cp"])
     # On macOS the game resolves resources (lang, mods, palettes, dynos, ...) at <exe dir>/../Resources
     # (src/pc/platform.c sys_resource_path, app-bundle layout). Point that at the plain build dir.
     res = SRC / "build" / "Resources"
