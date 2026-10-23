@@ -642,7 +642,7 @@ Expected: a line starting `error:` on stderr, `exit=1`, and `/tmp/sm64ar-out` do
 
 - [ ] **Step 9: Prepare a real pack on Linux**
 
-Run (ROM at `local/baserom.us.z64`): `python3 -I scripts/packs.py fetch render96-textures && python3 -I scripts/packs.py prepare render96-textures && python3 -I scripts/packs.py verify render96-textures`
+Run (ROM at `local/baserom.us.z64`): `python3 -I scripts/packs.py fetch render96-hd-textures && python3 -I scripts/packs.py prepare render96-hd-textures && python3 -I scripts/packs.py verify render96-hd-textures`
 Expected: `prepare` ends without `Refused`, the `.expected.json` is written and `verify` reports the pack's `.tex` count with no missing files. Then `python3 -I scripts/packs.py fetch render96-models && python3 -I scripts/packs.py prepare render96-models` likewise (`--generate-actors`).
 
 - [ ] **Step 10: Commit (two commits)**
@@ -660,5 +660,5 @@ git commit -m "quest: Linux pack tool runs DynOS's generators headlessly"
 
 - `nix develop` (or `direnv allow`) gives a shell in which `cmake -S . -B build/host -G Ninja -DSM64AR_OPENXR_DIR=$SM64AR_OPENXR_DIR -DSM64AR_GLSLANG_DIR=$SM64AR_GLSLANG_DIR && cmake --build build/host && ctest --test-dir build/host` passes with `test_runtime_cube`, `test_qx_convert`, `test_glsl_emitter`, `test_vulkan_cube` and `python3 -m unittest discover -s scripts/tests` passes.
 - `python3 scripts/quest_build.py --launch` installs and starts the app on a connected Quest 3S, which shows the cube on a fixed table in passthrough with head tracking and survives menu/doff/don.
-- `python3 -I scripts/packs.py prepare render96-textures` and `... render96-models` succeed on Linux.
+- `python3 -I scripts/packs.py prepare render96-hd-textures` and `... render96-models` succeed on Linux.
 - `git log --oneline` shows the `shared:` commits separately, listing every file the Mac check must cover.

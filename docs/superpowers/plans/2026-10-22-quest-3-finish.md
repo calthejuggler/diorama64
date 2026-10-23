@@ -247,7 +247,7 @@ Inventory to reproduce (from `SM64ARApp.swift`; the visionOS tab order is Level,
 - [ ] **Step 1: Write tests**: Python: `test_quest_bundle_assets_layout` (stage into a temp dir with a fake `bundle_local.stage` and fake res dir → `Bundled/bundled.json` and `res/res.json` exist and list the files). C++: `bundled_manifest_files` parses a manifest with 3 files in order; `bundled_copy_needed` is true for a missing installed manifest and for a differing one, false for an identical one.
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement**; in `main.cpp` the copy runs before `arvos_configure`, logging `AR_BUNDLED copied=N ms=…` or `AR_BUNDLED up_to_date`; `bundle_dir` for the bridge is `internalDataPath + "/bundled"`.
-- [ ] **Step 4: Run**: `python3 scripts/quest_build.py --packs render96-textures --launch`; the first launch logs `AR_BUNDLED copied=…` and the HD textures show; a second launch logs `up_to_date`; kill the app during the first copy (`adb shell am force-stop` within 2 s of launch) and relaunch: it copies again and the game boots. Remove `android:debuggable` from the manifest once Task 4's check is done.
+- [ ] **Step 4: Run**: `python3 scripts/quest_build.py --packs render96-hd-textures --launch`; the first launch logs `AR_BUNDLED copied=…` and the HD textures show; a second launch logs `up_to_date`; kill the app during the first copy (`adb shell am force-stop` within 2 s of launch) and relaunch: it copies again and the game boots. Remove `android:debuggable` from the manifest once Task 4's check is done.
 - [ ] **Step 5: Commit** — `git commit -m "quest: ROM, packs and resources bundled as APK assets"`.
 
 ---
