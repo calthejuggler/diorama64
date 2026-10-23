@@ -23,3 +23,13 @@ the plan task it verifies.
 - [ ] **Task 8 extra checks (from review)**: watch the first second after launch for a flash or dark veil before
       `AR_FIRST_FRAME` (none expected); grep logcat for `xrBeginFrame (retry)` across Meta-button and headset-off/on
       cycles and confirm the frame loop never stalls; confirm `AR_QUEST_STOP ticks=` is non-zero on exit.
+- [ ] **Plan 1 final-review additions**: logcat shows `AR_QUEST_SWAPCHAIN ... format=43 linearize=1`; cube faces are
+      neither washed out nor too dark and have no dark/bright fringes at the silhouette. Cover the cameras: the cube
+      stays world-locked or freezes, never snaps to the origin. With a stationary boundary: `AR_QUEST_SPACE stage=0`
+      and the cube about 0.75 m below eye level. Quit from the Quest menu: `AR_QUEST_STOP`, no ANR; relaunch logs the
+      pipeline cache size. Grep logcat for `AR_VULKAN` failures and repeated `AR_QUEST_XR` lines (expect none). If
+      `xrInitializeLoaderKHR`/`xrCreateInstance` fails, retry once with `XR_KHR_loader_init_android` enabled before
+      calling it the loader blocker.
+- Note (Mac check, plan 3): diff the shared files over the whole range (`git diff 7189b65..HEAD -- CMakeLists.txt
+  cmake runtime/CMakeLists.txt games/sm64/CMakeLists.txt runtime/platform/visionos/vos_log.cpp games/sm64/adapter scripts`),
+  not only the `shared:` commits.
