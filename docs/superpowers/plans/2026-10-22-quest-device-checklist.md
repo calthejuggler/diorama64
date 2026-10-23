@@ -69,3 +69,9 @@ the plan task it verifies.
       line (depth/stencil modes, independentResolve flags). Long-press recentre: the level stays on the table. Right
       stick right turns the level clockwise seen from above. As built: X punches, the right trigger does nothing in a
       level. Compare `AR_PERF` GPU ms with `--es look shadows=0` against the default. Note `adb install` time.
+
+## Plan 3
+
+- [ ] **Task 1 (stereo audio)**: music and SFX in both ears without crackle; logcat shows `AR_AUDIO backend=aaudio rate=48000`;
+      `adb shell dumpsys media.audio_flinger | grep -A3 Diorama` shows one 48 kHz stream; headset off 10 s and on:
+      audio resumes without a burst (no `trimmed` jump over 2400 frames); the sm64 `audio` setting off silences it.
