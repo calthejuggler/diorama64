@@ -90,3 +90,7 @@ the plan task it verifies.
       highlight follow the right controller; each tab's controls change their setting live (shadows off, msaa 1 shows
       aliasing, a level pick warps, Re-place table moves the level, Quit exits cleanly); settings survive a restart; the
       panel closes with the menu button and the game pointer works again. Text renders with Roboto (not the 5×7 fallback).
+- [ ] **Task 6 (bundled assets)**: `python3 scripts/quest_build.py --launch` (default packs): the first launch logs
+      `AR_BUNDLED copied=N ms=…` and the HD textures show; a second launch logs `AR_BUNDLED up_to_date`; kill the app
+      within 2 s of the first launch (`adb shell am force-stop org.pagetable.diorama64`) and relaunch: it copies again and
+      boots. Note the APK size and `adb install` time after stripping.
