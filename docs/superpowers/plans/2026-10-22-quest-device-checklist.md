@@ -39,3 +39,7 @@ the plan task it verifies.
 - [ ] **Task 2 (MSAA)**: logcat shows `AR_MSAA samples=4` (or 2). If it shows `AR_VULKAN depth_resolve=0` the Adreno driver
       lacks `VK_RESOLVE_MODE_MAX_BIT` for depth and the app runs at 1 sample; report it. With MSAA on, check texture-edge
       cutouts (tree cards, fences) for alpha fringes against passthrough (alpha-to-one is not enabled).
+- [ ] **Task 4 (sm64 boots)**: `python3 scripts/quest_build.py --rom local/baserom.us.z64 --launch && python3 scripts/quest_device.py logcat`
+      Expected: `AR_ADAPTERS sm64=...`, `AR_SCREEN ...` lines, `AR_RENDER layered=1 ...`, no `AR_QUEST_FAIL`; Bob-omb
+      Battlefield (the level start) stands on the fixed table, Mario idle, at the display rate. Note the `AR_PERF`/
+      `AR_HITCH` lines for plan 3's performance pass.
