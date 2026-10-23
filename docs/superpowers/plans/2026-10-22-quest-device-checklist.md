@@ -75,3 +75,6 @@ the plan task it verifies.
 - [ ] **Task 1 (stereo audio)**: music and SFX in both ears without crackle; logcat shows `AR_AUDIO backend=aaudio rate=48000`;
       `adb shell dumpsys media.audio_flinger | grep -A3 Diorama` shows one 48 kHz stream; headset off 10 s and on:
       audio resumes without a burst (no `trimmed` jump over 2400 frames); the sm64 `audio` setting off silences it.
+- [ ] **Task 1 extra (audio path)**: record whether the AAudio stream is MMAP or legacy (`adb shell dumpsys media.aaudio` or
+      the stream's `AAudioStream_isMMapUsed` logged at start); the resume path assumes nothing about it, but the note helps
+      if crackle appears after doff/don.
