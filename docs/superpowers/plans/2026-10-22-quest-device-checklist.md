@@ -55,6 +55,9 @@ the plan task it verifies.
 - [ ] **Task 7 (table from the room scan)**: after Space Setup with a table, the level appears on the real table at the
       right height (`AR_QUEST_SCENE tables=N chosen=<uuid>` in logcat). Hold a grip and move the controller: the level
       slides along the surface and stops at the table's edge; the right stick turns it; release; restart the app: the
-      placement is kept. With a second scanned table, `adb shell am broadcast -a org.pagetable.diorama64.REPLACE`
-      moves the level to the table you stand next to. Revoke the scene permission in Settings: the hint is logged
+      placement is kept. With a second scanned table, relaunch with
+      `adb shell am start -S -n org.pagetable.diorama64/android.app.NativeActivity --ez replace true`
+      and the level moves to the table you stand next to (`--ez scan true` requests Space Setup instead). Revoke the scene permission in Settings: the hint is logged
       (`AR_QUEST_SCENE permission=denied`) and passthrough stays up.
+- [ ] **Task 8 (depth submission)**: the level stays locked to the table during fast head turns (positional reprojection
+      now has depth); `adb logcat` shows no `XR_ERROR_*` lines.
