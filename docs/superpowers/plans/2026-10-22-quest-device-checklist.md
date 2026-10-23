@@ -78,3 +78,7 @@ the plan task it verifies.
 - [ ] **Task 1 extra (audio path)**: record whether the AAudio stream is MMAP or legacy (`adb shell dumpsys media.aaudio` or
       the stream's `AAudioStream_isMMapUsed` logged at start); the resume path assumes nothing about it, but the note helps
       if crackle appears after doff/don.
+- [ ] **Task 2 (spatial audio)**: with the sm64 `sound` setting `spatial`, a coin collected to your left is louder in the left
+      ear and turning the head swings it; music follows the ring/bed setting; switching `sound` between stereo and
+      spatial live takes effect (a switch *to* spatial after a stereo boot logs `AR_AUDIO spatial needs restart` and
+      needs an app restart: this limit is known).
