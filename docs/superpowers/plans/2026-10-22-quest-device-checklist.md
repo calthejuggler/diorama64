@@ -61,3 +61,11 @@ the plan task it verifies.
       (`AR_QUEST_SCENE permission=denied`) and passthrough stays up.
 - [ ] **Task 8 (depth submission)**: the level stays locked to the table during fast head turns (positional reprojection
       now has depth); `adb logcat` shows no `XR_ERROR_*` lines.
+- [ ] **Plan 2 final-review additions**: with the permission granted and no table scanned, expect `AR_QUEST_SCENE hint=No table…`;
+      run Space Setup from the system menu, return: `query=requested` then `chosen=<uuid>` with no restart. Hold the
+      trigger on a file-select entry, press the Meta button, return: `AR_POINTER cancel` (not `end`) and no file picked.
+      Hold a grip and A through a Meta-button visit: no drag starts on return (note whether Mario jumps). Logcat shows
+      `AR_QUEST_DEPTH on format=…` and no `resolve: target depth is not sampleable`; record the `AR_VULKAN resolve_modes`
+      line (depth/stencil modes, independentResolve flags). Long-press recentre: the level stays on the table. Right
+      stick right turns the level clockwise seen from above. As built: X punches, the right trigger does nothing in a
+      level. Compare `AR_PERF` GPU ms with `--es look shadows=0` against the default. Note `adb install` time.
