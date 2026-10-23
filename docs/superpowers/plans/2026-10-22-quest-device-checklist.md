@@ -52,3 +52,9 @@ the plan task it verifies.
       `--es game sm64 --es start story`: the title screen appears; point the right controller at the file select and
       pull the trigger to pick a file (`AR_POINTER begin/end` and `AR_TOUCH` lines appear). Press the left menu
       button: `AR_PANEL toggle open=1` (the panel itself arrives in plan 3).
+- [ ] **Task 7 (table from the room scan)**: after Space Setup with a table, the level appears on the real table at the
+      right height (`AR_QUEST_SCENE tables=N chosen=<uuid>` in logcat). Hold a grip and move the controller: the level
+      slides along the surface and stops at the table's edge; the right stick turns it; release; restart the app: the
+      placement is kept. With a second scanned table, `adb shell am broadcast -a org.pagetable.diorama64.REPLACE`
+      moves the level to the table you stand next to. Revoke the scene permission in Settings: the hint is logged
+      (`AR_QUEST_SCENE permission=denied`) and passthrough stays up.
