@@ -47,3 +47,8 @@ the plan task it verifies.
       supports); the room-lit look shows shadows and AO on the table; no `AR_HITCH` storm while idle. Try
       `adb shell am start -n org.pagetable.diorama64/android.app.NativeActivity --es look "msaa=2,shadows=objects"`
       and confirm `AR_LOOK msaa=2` / `AR_LOOK shadows=objects` lines and the visible change.
+- [ ] **Task 6 (Touch controllers)**: logcat shows `AR_INPUT profile=touch attached=1`; Mario walks with the left stick,
+      jumps with A, punches with B, crouches with the left trigger. Launch with
+      `--es game sm64 --es start story`: the title screen appears; point the right controller at the file select and
+      pull the trigger to pick a file (`AR_POINTER begin/end` and `AR_TOUCH` lines appear). Press the left menu
+      button: `AR_PANEL toggle open=1` (the panel itself arrives in plan 3).
