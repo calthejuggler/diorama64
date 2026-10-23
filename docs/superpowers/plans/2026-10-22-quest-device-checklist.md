@@ -83,6 +83,6 @@ the plan task it verifies.
       spatial live takes effect (a switch *to* spatial after a stereo boot logs `AR_AUDIO spatial needs restart` and
       needs an app restart: this limit is known).
 - [ ] **Task 4 (settings bridge)**: `adb shell am start -S -n org.pagetable.diorama64/android.app.NativeActivity --es args "--game sm64 --look msaa=2 --start story"`
-      (or the per-key extras, see the task report) → logcat shows `AR_ARGS`, `AR_LOOK msaa=2` and the title screen; after a
+      (or the per-key extras, see the task report) → logcat shows `AR_ARGS`, `AR_SETTING look.msaa=2` and the title screen; after a
       clean quit, `prefs.json` in the app's files dir contains `"look.msaa": "2"` (needs the debuggable flag or a later
       panel read-back).
