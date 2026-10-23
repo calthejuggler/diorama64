@@ -86,3 +86,7 @@ the plan task it verifies.
       (or the per-key extras, see the task report) → logcat shows `AR_ARGS`, `AR_SETTING look.msaa=2` and the title screen; after a
       clean quit, `prefs.json` in the app's files dir contains `"look.msaa": "2"` (needs the debuggable flag or a later
       panel read-back).
+- [ ] **Task 5 (settings panel)**: the left menu button opens the panel above the level facing you; the ray and hover
+      highlight follow the right controller; each tab's controls change their setting live (shadows off, msaa 1 shows
+      aliasing, a level pick warps, Re-place table moves the level, Quit exits cleanly); settings survive a restart; the
+      panel closes with the menu button and the game pointer works again. Text renders with Roboto (not the 5×7 fallback).
