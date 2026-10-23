@@ -80,8 +80,8 @@ the plan task it verifies.
       if crackle appears after doff/don.
 - [ ] **Task 2 (spatial audio)**: with the sm64 `sound` setting `spatial`, a coin collected to your left is louder in the left
       ear and turning the head swings it; music follows the ring/bed setting; switching `sound` between stereo and
-      spatial live takes effect (a switch *to* spatial after a stereo boot logs `AR_AUDIO spatial needs restart` and
-      needs an app restart: this limit is known).
+      spatial live takes effect both ways (`AR_AUDIO mode=spatial` / `AR_AUDIO mode=stereo`; the runtime boots in
+      SOURCES whenever the adapter accepts it).
 - [ ] **Task 4 (settings bridge)**: `adb shell am start -S -n org.pagetable.diorama64/android.app.NativeActivity --es args "--game sm64 --look msaa=2 --start story"`
       (or the per-key extras, see the task report) → logcat shows `AR_ARGS`, `AR_SETTING look.msaa=2` and the title screen; after a
       clean quit, `prefs.json` in the app's files dir contains `"look.msaa": "2"` (needs the debuggable flag or a later
