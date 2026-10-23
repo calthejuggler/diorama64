@@ -94,3 +94,17 @@ the plan task it verifies.
       `AR_BUNDLED copied=N ms=…` and the HD textures show; a second launch logs `AR_BUNDLED up_to_date`; kill the app
       within 2 s of the first launch (`adb shell am force-stop org.pagetable.diorama64`) and relaunch: it copies again and
       boots. Note the APK size and `adb install` time after stripping.
+- [ ] **Task 7 (`./build.py` end to end)**: from a clean `build/` directory, `direnv allow && ./build.py` asks for the ROM
+      and the packs, builds everything, installs, and the headset shows the game with the chosen packs.
+- [ ] **Task 8 (performance pass, needs the headset)**: with the default Look on Bob-omb Battlefield, Castle grounds and
+      Jolly Roger Bay, record the `AR_PERF` gpu_ms p50/p95 over 60 s each at 90 Hz (budget 11.1 ms; 13.9 ms at 72 Hz).
+      If p95 fits, leave `kQuestLookSeed` empty. Else try, each alone, in order: `--es look msaa=2`, `ao=0`,
+      `shadows=objects`; pick the smallest set that fits and put it in `kQuestLookSeed` (apps/quest/quest_app.cpp);
+      if none fits, seed `msaa=2,ao=0` and set `Config.refresh_hz = 72`. Write the numbers into
+      `docs/superpowers/plans/2026-10-22-quest-perf.md`.
+- [ ] **Task 9 (the Mac check, needs the Mac with Xcode 26)**: `./build.py --no-install` (headset target); if a Vision Pro
+      is at hand, a run; `python3 scripts/visionos_build.py` for the simulator; the macOS harness
+      (`cmake -S . -B build/macos -G Ninja && cmake --build build/macos`). Review the shared files over the whole range:
+      `git diff 7189b65..HEAD -- CMakeLists.txt cmake runtime/CMakeLists.txt games/sm64/CMakeLists.txt games/sm64/patches
+      games/sm64/adapter runtime/platform/visionos/vos_log.cpp runtime/adapters/cube scripts`. Fix anything broken in
+      `shared-fix:` commits and note the checked commit hash and outcome in `docs/superpowers/plans/2026-10-22-quest-perf.md`.
