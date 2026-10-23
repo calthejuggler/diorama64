@@ -108,3 +108,14 @@ the plan task it verifies.
       `git diff 7189b65..HEAD -- CMakeLists.txt cmake runtime/CMakeLists.txt games/sm64/CMakeLists.txt games/sm64/patches
       games/sm64/adapter runtime/platform/visionos/vos_log.cpp runtime/adapters/cube scripts`. Fix anything broken in
       `shared-fix:` commits and note the checked commit hash and outcome in `docs/superpowers/plans/2026-10-22-quest-perf.md`.
+- [ ] **Plan 3 final-review additions**: on a fresh install with default packs, `AR_BUNDLED copied=N ms=…` (note the ms),
+      no ANR (`adb logcat | grep -i anr`), the Meta button works during the copy; after installing a build with a different
+      pack set the copy runs again and the old packs are gone. Panel open at MSAA 4: `late=` in `AR_PERF` stays 0; watch
+      `AR_HITCH` on the first open (font bake) and during a stick slide. Plug/unplug USB-C or Bluetooth headphones
+      mid-level: `AR_AUDIO restart` and the sound continues without a burst. Boot with `sound=stereo` saved, switch to
+      Spatial in the panel: the coin-panning test works with no restart; switch back. If a Look seed was chosen:
+      `adb uninstall` first, then launch: `AR_LOOK seed k=v` followed by `AR_SETTING look.k=v` and no "dropped" line.
+      Change one control per tab, `am force-stop` within 0.3 s and again after 1 s, relaunch: note which values survive.
+      Listen for the spatial head-turn swing lagging the head. Note whether Lakitu's camera turns while sliding a
+      slider with the panel open. Quit from the panel: `AR_APP quit requested`, `AR_QUEST_STOP`, `AR_QUEST_EXIT`, no ANR;
+      the next launch keeps the last changes.
