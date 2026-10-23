@@ -43,3 +43,7 @@ the plan task it verifies.
       Expected: `AR_ADAPTERS sm64=...`, `AR_SCREEN ...` lines, `AR_RENDER layered=1 ...`, no `AR_QUEST_FAIL`; Bob-omb
       Battlefield (the level start) stands on the fixed table, Mario idle, at the display rate. Note the `AR_PERF`/
       `AR_HITCH` lines for plan 3's performance pass.
+- [ ] **Task 5 (session parity)**: on launch logcat shows `AR_WARMUP` then `AR_MSAA samples=4` (or what the device
+      supports); the room-lit look shows shadows and AO on the table; no `AR_HITCH` storm while idle. Try
+      `adb shell am start -n org.pagetable.diorama64/android.app.NativeActivity --es look "msaa=2,shadows=objects"`
+      and confirm `AR_LOOK msaa=2` / `AR_LOOK shadows=objects` lines and the visible change.
