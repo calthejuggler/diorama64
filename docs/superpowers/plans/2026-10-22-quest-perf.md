@@ -1,7 +1,7 @@
 # Quest 3S performance pass (Plan 3, Task 8)
 
-Filled in by the user from a headset session. Until then `kQuestLookSeed` in `apps/quest/quest_app.cpp` is empty (the
-defaults are unchanged) and the logcat shows `AR_LOOK seed none` at startup.
+Filled in from headset sessions. `kQuestLookSeed` in `apps/quest/quest_app.cpp` holds the first-run Look values; the
+logcat shows `AR_LOOK seed k=v` at startup for each key the player has not stored yet.
 
 ## Measurement procedure
 
@@ -27,7 +27,14 @@ the README.
 
 ## Chosen seed
 
-Chosen seed: (none measured yet)
+Chosen seed: `mode=original` (2026-11-01).
+
+First headset session (Quest 3S, 2026-10-31, default packs including Render96 Models): on the file select the game ran
+at 90 Hz with gpu_ms p50 1.9 / p95 3.2. Inside the castle with Room-lit it fell to about 7 Hz: each frame ran four
+catch-up ticks with step_ms about 134 (about 33 ms per tick, CPU in the game step; the GPU was not the limit). Turning off
+Draw all rooms did not help; switching Look to Original N64 did, which points at Room-lit's per-tick smooth-normal
+derivation. Not yet profiled: the APK is now `profileable` so `adb shell simpleperf record --app org.pagetable.diorama64`
+works on the next session. MSAA is 1 on this device (`AR_VULKAN depth_resolve=0`).
 
 ## visionOS check (the Mac, Xcode 26)
 
